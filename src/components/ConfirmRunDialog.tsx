@@ -66,7 +66,18 @@ export const CONFIRM_RUN_DIALOG_TITLE = "Redeem this coupon code?"
 export const PREVIOUSLY_USED_TITLE = "This coupon code was already used"
 
 /** Visible text of the dismiss control (Requirement 2.6). */
-export const DISMISS_LABEL = "Cancel, keep the coupon code"
+export const DISMISS_LABEL = "Cancel"
+
+/**
+ * Visible text of the confirm control — the one control that may start a
+ * Redemption_Run (Requirement 2.5).
+ *
+ * Both action labels are exported constants rather than inline text because the
+ * tests locate these controls by accessible name. Reconstructing the name in a
+ * test is what let it drift from the component before; importing it means a
+ * relabelling like this one is a single edit here.
+ */
+export const CONFIRM_LABEL = "Confirm"
 
 export interface ConfirmRunDialogProps {
   /**
@@ -219,7 +230,7 @@ export function ConfirmRunDialog({
             disabled={enabled.length === 0}
             onClick={onConfirm}
           >
-            Redeem for {enabled.length} {memberWord}
+            {CONFIRM_LABEL}
           </Button>
         </DialogFooter>
       </DialogContent>

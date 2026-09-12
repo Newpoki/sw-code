@@ -46,14 +46,13 @@ import fc from "fast-check"
 import { describe, expect, it } from "vitest"
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 
-import { DISMISS_LABEL } from "@/components/ConfirmRunDialog"
+import { CONFIRM_LABEL, DISMISS_LABEL } from "@/components/ConfirmRunDialog"
 import { COUPON_CODE_LABEL, SUBMIT_LABEL } from "@/components/CouponForm"
 import { RedemptionPage } from "@/routes/index"
 import type { RedemptionPageProps } from "@/routes/index"
 import type {
   ActiveRunSnapshot,
   Envelope,
-  MemberRegistryEntry,
   RedemptionHistoryRecord,
   RunEvent,
 } from "@/domain/types"
@@ -106,12 +105,6 @@ async function flush(): Promise<void> {
  */
 function keysOf(value: unknown): string[] {
   return Object.keys(value as object)
-}
-
-/** The confirm control's visible text, which states the enabled member count. */
-function confirmLabel(entries: readonly MemberRegistryEntry[]): string {
-  const enabled = entries.filter((entry) => entry.enabled).length
-  return `Redeem for ${enabled} group member${enabled === 1 ? "" : "s"}`
 }
 
 describe("Property 11: the redemption payload carries the Coupon_Code alone", () => {
@@ -192,7 +185,7 @@ describe("Property 11: the redemption payload carries the Coupon_Code alone", ()
               fireEvent.click(submit)
             })
             const confirm = screen.getByRole("button", {
-              name: confirmLabel(roster),
+              name: CONFIRM_LABEL,
             })
             await act(async () => {
               fireEvent.click(confirm)

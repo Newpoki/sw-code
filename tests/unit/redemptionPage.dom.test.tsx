@@ -33,6 +33,7 @@ import { describe, expect, it } from "vitest"
 import { act, fireEvent, render, screen, within } from "@testing-library/react"
 
 import {
+  CONFIRM_LABEL,
   CONFIRM_RUN_DIALOG_TITLE,
   DISMISS_LABEL,
 } from "@/components/ConfirmRunDialog"
@@ -298,12 +299,6 @@ async function flush(): Promise<void> {
   })
 }
 
-/** The visible text of the confirm control, which states the enabled count. */
-function confirmLabel(entries: readonly MemberRegistryEntry[]): string {
-  const enabled = entries.filter((member) => member.enabled).length
-  return `Redeem for ${enabled} group member${enabled === 1 ? "" : "s"}`
-}
-
 /** The counter line of the progress indicator (Requirement 2.7). */
 function progressText(): string {
   return screen.getByRole("status").textContent
@@ -363,9 +358,7 @@ async function submitAndConfirm(page: Page, couponCode: string): Promise<void> {
   await submit(page, couponCode)
   const dialog = screen.getByRole("dialog", { name: CONFIRM_RUN_DIALOG_TITLE })
   await act(async () => {
-    fireEvent.click(
-      within(dialog).getByRole("button", { name: confirmLabel(page.entries) })
-    )
+    fireEvent.click(within(dialog).getByRole("button", { name: CONFIRM_LABEL }))
   })
   await flush()
 }

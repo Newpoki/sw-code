@@ -26,6 +26,20 @@ export default [
     },
   },
   {
-    ignores: ["eslint.config.js", ".prettierrc"],
+    /*
+     * Build output is not source. Flat config does not read `.gitignore`, so
+     * these have to be named here even though they are ignored by git: the
+     * Nitro/Vercel target emits `.output/`, the node-server target emits
+     * `dist/`, and linting either one fails with a parser error, because the
+     * emitted `.js` files are not part of any tsconfig project.
+     */
+    ignores: [
+      "eslint.config.js",
+      ".prettierrc",
+      ".output/**",
+      "dist/**",
+      "dist-ssr/**",
+      ".tanstack/**",
+    ],
   },
 ]
