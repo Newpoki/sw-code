@@ -372,7 +372,7 @@ All code is TypeScript. Testing uses Vitest, fast-check for the 24 correctness p
 
   - [x] 14.4 Implement `RunResultTable` and `OutcomeSummary`
     - One row per Member_Outcome of the fixed list in processing order, including `SKIPPED` rows, each holding the Member_Label and the Member_Outcome
-    - `UPSTREAM_ERROR` and `TRANSPORT_ERROR` rows render the response message as a React text child truncated with `{message.slice(0, 500)}`, with every markup character visible as a character and no `dangerouslySetInnerHTML`
+    - `UPSTREAM_ERROR` and `TRANSPORT_ERROR` rows render the response message as a React text child with its HTML tags removed by `stripUpstreamMarkup`, truncated to 500 characters after that removal, and no `dangerouslySetInnerHTML`
     - `OutcomeSummary` renders all six counts over `MEMBER_OUTCOME_VALUES`, including counts equal to zero
     - _Requirements: 6.1, 6.2, 6.3_
 
@@ -399,7 +399,7 @@ All code is TypeScript. Testing uses Vitest, fast-check for the 24 correctness p
   - [x] 14.9 Write property test for result rendering
     - **Property 20: Result rendering is literal and complete**
     - **Validates: Requirements 6.1, 6.2, 6.3**
-    - Generate hostile messages containing markup and assert every markup character renders as a visible character, the message is truncated at 500 characters, and all six counts render
+    - Generate hostile messages containing markup and assert no HTML tag survives as text, no element is created from one, the message is truncated at 500 characters after tag removal, and all six counts render
     - Tagged `// Feature: shared-coupon-redemption, Property 20: ...`, `numRuns: 100` minimum
 
   - [x] 14.10 Write property test for the redemption payload

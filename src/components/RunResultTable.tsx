@@ -17,16 +17,24 @@
  * reordering here would be a second, competing definition of "processing
  * order", and a filter would drop a row Requirement 6.1 demands.
  *
- * ## Why the message is a plain text child
+ * ## Why the message is a plain text child, with its tags removed
  *
- * Requirement 6.2 wants the response message of an `UPSTREAM_ERROR` or
- * `TRANSPORT_ERROR` row shown as literal text, with every markup character
- * visible as a character. The documented `(H306)` body carries
- * `Invalid coupon code.<br/>Please check again.`, so this is not hypothetical.
- * Passing the string as a React text child is exactly that: React escapes it
- * into a text node, so `<br/>` reaches the page as the six characters `<br/>`
- * rather than a line break. Nothing here uses `dangerouslySetInnerHTML`, and
- * the `react/no-danger` ESLint rule enabled in task 1.3 keeps it that way.
+ * The documented `(H306)` body carries
+ * `Invalid coupon code.<br/>Please check again.`, so upstream HTML is not
+ * hypothetical. Requirement 6.2 forbids that markup from being *interpreted*;
+ * two readings satisfy it, and this component now takes the second:
+ *
+ *   - show every markup character as a character, so `<br/>` appears as six
+ *     visible characters. Safe, and what this file used to do — but it puts
+ *     upstream noise in front of the reader.
+ *   - remove the tag before display, via `stripUpstreamMarkup`. The message is
+ *     still passed as a React text child, so a tag is *deleted, never
+ *     interpreted*, and the reader sees prose.
+ *
+ * The injection defence is identical either way and does not rest on this
+ * choice: nothing here uses `dangerouslySetInnerHTML`, the `react/no-danger`
+ * ESLint rule forbids introducing it, and `serverFunctionSurface.test.ts` fails
+ * if it ever appears in `src/`.
  *
  * The message is truncated with `slice` at {@link MAX_DISPLAYED_MESSAGE_CHARS}.
  * `normalizeRetMsg` in the Response_Parser already caps every
@@ -48,6 +56,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
+import { stripUpstreamMarkup } from "@/domain/upstreamMessage"
 import type { MemberOutcome, MemberOutcomeValue } from "@/domain/types"
 
 /** Requirement 6.2: the displayed message holds at most 500 characters. */
@@ -119,7 +128,12 @@ function displayedMessage(outcome: MemberOutcome): string | null {
   ) {
     return null
   }
-  return outcome.upstreamResult.responseMessage.slice(
+  /*
+   * Tags are stripped before truncating, so the 500-character budget is spent on
+   * text a reader can use rather than on `<br/>`, and a message that is only
+   * markup collapses to nothing instead of to a row of tags.
+   */
+  return stripUpstreamMarkup(outcome.upstreamResult.responseMessage).slice(
     0,
     MAX_DISPLAYED_MESSAGE_CHARS
   )

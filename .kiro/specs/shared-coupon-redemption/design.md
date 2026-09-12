@@ -827,7 +827,11 @@ Properties 18 to 20 cover the Web_Client.
 
 ### Property 20: Result rendering is literal and complete
 
-*For any* completed Redemption_Run result, the result view renders one row per Member_Outcome of the fixed list in processing order, including every `SKIPPED` row, each holding the Member_Label and the Member_Outcome; renders the response message of every `UPSTREAM_ERROR` and `TRANSPORT_ERROR` row as literal text with every markup character visible as a character and truncated to its first 500 characters; and renders a summary holding all six outcome counts including counts equal to zero.
+*For any* completed Redemption_Run result, the result view renders one row per Member_Outcome of the fixed list in processing order, including every `SKIPPED` row, each holding the Member_Label and the Member_Outcome; renders the response message of every `UPSTREAM_ERROR` and `TRANSPORT_ERROR` row as text that holds no HTML tag and from which no element is created, truncated to its first 500 characters after tag removal; and renders a summary holding all six outcome counts including counts equal to zero.
+
+Note on the second clause, which was revised. It originally required every markup character to be *visible as a character*, so `<br/>` was shown to the reader as six characters. Both readings satisfy Requirement 6.2's real obligation — upstream text must never be interpreted as markup — but the original put upstream noise in front of the reader, and the Upstream_API does send HTML: `Invalid coupon code.<br/>Please check again.` and `Invalid Hive ID.<br/>Please check again.` are documented bodies. Tags are therefore removed before display by `stripUpstreamMarkup` in `src/domain/upstreamMessage.ts`, with `<br>` becoming a newline so the break the upstream intended survives.
+
+The injection defence does not rest on that choice and is unchanged: a tag is *deleted, never interpreted*, the result is still passed as a React text child, `dangerouslySetInnerHTML` remains banned by the `react/no-danger` ESLint rule, and `tests/unit/serverFunctionSurface.test.ts` fails if it ever appears in `src/`. Stored values are untouched, so the Response_Parser round trip of Requirement 4.8 and the Redemption_History records are unaffected. HTML entities are deliberately not decoded, since decoding `&lt;br/&gt;` would manufacture the very tag being removed.
 
 **Validates: Requirements 6.1, 6.2, 6.3**
 

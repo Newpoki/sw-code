@@ -22,7 +22,7 @@
  */
 
 import { describe, expect, it } from "vitest"
-import { render, screen, within } from "@testing-library/react"
+import { fireEvent, render, screen, within } from "@testing-library/react"
 
 import {
   EMPTY_HISTORY_MESSAGE,
@@ -244,49 +244,175 @@ describe("HistoryTable record fields", () => {
     expect(within(row).queryByText(STOPPED_EARLY_LABEL)).toBe(null)
   })
 
-  it("renders every stored outcome with its label, outcome, code, and message", () => {
+  it("summarises the outcomes as one badge per group, not one per Group_Member", () => {
     const { row } = renderRow()
-    const entries = row.querySelectorAll("li")
+    const badges = row.querySelectorAll("[data-summary]")
 
-    expect(entries.length).toBe(stored.outcomes.length)
-
-    stored.outcomes.forEach((expected, index) => {
-      const entry = entries[index] as HTMLElement
-
-      expect(within(entry).getByText(expected.memberLabel)).toBeTruthy()
-      // The outcome value as text, so no row conveys it by colour alone.
-      expect(within(entry).getByText(expected.outcome)).toBeTruthy()
-
-      if (expected.responseCode.length > 0) {
-        expect(within(entry).getByText(expected.responseCode)).toBeTruthy()
-      }
-      if (expected.responseMessage.length > 0) {
-        expect(within(entry).getByText(expected.responseMessage)).toBeTruthy()
-      }
-    })
+    /*
+     * `stored` holds one SUCCESS, one ALREADY_USED, and one SKIPPED. The latter
+     * two share the warning group, so three Group_Members summarise to two
+     * badges — which is the whole point of the change.
+     */
+    expect(
+      Array.from(badges).map((badge) => [
+        badge.getAttribute("data-summary"),
+        badge.textContent,
+      ])
+    ).toEqual([
+      ["default", "1 succeeded"],
+      ["warning", "2 already used or skipped"],
+    ])
   })
 
-  it("renders the outcomes in the stored order", () => {
+  it("omits a group with no members rather than rendering a zero", () => {
     const { row } = renderRow()
-    const labels = Array.from(row.querySelectorAll("li")).map(
-      (entry) => entry.querySelector("span")?.textContent
-    )
 
-    expect(labels).toEqual(["Ada", "Grace", "Linus"])
+    // No outcome of `stored` is a failure, so no destructive badge appears.
+    expect(row.querySelector('[data-summary="destructive"]')).toBe(null)
+  })
+
+  it("shows the count visibly and names what was counted for assistive tech", () => {
+    const { row } = renderRow()
+    const badge = row.querySelector('[data-summary="default"]') as HTMLElement
+
+    /*
+     * The digit is the visible part; the noun is `sr-only`, so the cell stays
+     * glanceable without leaving colour as the only carrier of what it counts.
+     */
+    const srOnly = badge.querySelector(".sr-only")
+    expect(srOnly?.textContent.trim()).toBe("succeeded")
+    expect(badge.textContent).toContain("1")
+  })
+
+  it("keeps the response code and message out of the cell", () => {
+    const { row } = renderRow()
+
+    for (const expected of stored.outcomes) {
+      if (expected.responseMessage.length > 0) {
+        expect(within(row).queryByText(expected.responseMessage)).toBe(null)
+      }
+    }
+  })
+
+  it("keeps the per-member breakdown out of the cell", () => {
+    const { row } = renderRow()
+
+    // The Member_Labels live in the drawer now, not in the column.
+    for (const expected of stored.outcomes) {
+      expect(within(row).queryByText(expected.memberLabel)).toBe(null)
+    }
+  })
+
+  it("names the trigger by the run it opens, not by a bare 'View details'", () => {
+    const { row } = renderRow()
+    const trigger = within(row).getByRole("button")
+
+    const name = trigger.textContent
+    expect(name).toContain(stored.couponCode)
+    // The counts are part of the name, so the action is not just "View details".
+    expect(name).toContain("succeeded")
   })
 })
 
-describe("HistoryTable literal message rendering (Requirement 6.2)", () => {
-  it("renders the documented (H306) message as characters, creating no line break", () => {
-    const message = "Invalid coupon code.<br/>Please check again."
-    const { container } = render(
+/**
+ * Opens the detail drawer of the first row and returns the drawer element.
+ *
+ * The drawer renders into a portal on `document.body`, not inside the render
+ * container, so everything about it is queried from `screen`.
+ */
+function openDetails(): HTMLElement {
+  fireEvent.click(screen.getAllByRole("button")[0])
+  return screen.getByRole("dialog")
+}
+
+describe("HistoryTable outcome details drawer", () => {
+  const stored = record({
+    outcomes: [
+      outcome({
+        hiveId: "hive-ada",
+        memberLabel: "Ada",
+        outcome: "SUCCESS",
+        responseCode: "100",
+        responseMessage: "The coupon gift has been sent.",
+      }),
+      outcome({
+        hiveId: "hive-grace",
+        memberLabel: "Grace",
+        outcome: "TRANSPORT_ERROR",
+        responseCode: "",
+        responseMessage: "response body is not valid JSON",
+      }),
+    ],
+  })
+
+  it("stays closed until the summary is activated", () => {
+    render(<HistoryTable records={[stored]} />)
+
+    expect(screen.queryByRole("dialog")).toBe(null)
+  })
+
+  it("shows each Group_Member with its outcome badge and message", () => {
+    render(<HistoryTable records={[stored]} />)
+    const drawer = openDetails()
+
+    for (const expected of stored.outcomes) {
+      expect(within(drawer).getByText(expected.memberLabel)).toBeTruthy()
+      // The outcome value, in a badge (Requirement 6.2 keeps it literal text).
+      expect(within(drawer).getByText(expected.outcome)).toBeTruthy()
+      if (expected.responseCode.length > 0) {
+        expect(within(drawer).getByText(expected.responseCode)).toBeTruthy()
+      }
+      expect(within(drawer).getByText(expected.responseMessage)).toBeTruthy()
+    }
+  })
+
+  it("gives each detail badge the same outcome mark as the summary", () => {
+    render(<HistoryTable records={[stored]} />)
+    const drawer = openDetails()
+
+    /*
+     * The variant is derived from `data-outcome` through one shared map, so
+     * matching marks are what guarantee "the same colour in both views" without
+     * this test having to know a class name.
+     */
+    expect(
+      Array.from(drawer.querySelectorAll("[data-outcome]")).map((badge) =>
+        badge.getAttribute("data-outcome")
+      )
+    ).toEqual(stored.outcomes.map((expected) => expected.outcome))
+  })
+
+  it("lists the members in the stored order", () => {
+    render(<HistoryTable records={[stored]} />)
+    const drawer = openDetails()
+
+    expect(
+      Array.from(drawer.querySelectorAll("li")).map(
+        (entry) => entry.querySelector("span")?.textContent
+      )
+    ).toEqual(["Ada", "Grace"])
+  })
+})
+
+/**
+ * Requirement 6.2, in its current reading: no upstream markup reaches the reader
+ * as markup, and none reaches them as visible text either.
+ *
+ * The second half is what changed. The message used to be displayed with its tags
+ * spelled out, which is safe but shows `<br/>` to a reader; the tags are now
+ * removed before display. The injection guarantee is untouched and is still
+ * asserted here — a tag is deleted, never interpreted.
+ */
+describe("HistoryTable upstream message rendering (Requirement 6.2)", () => {
+  function renderMessage(message: string, code = "(H306)"): HTMLElement {
+    render(
       <HistoryTable
         records={[
           record({
             outcomes: [
               outcome({
                 outcome: "INVALID_COUPON",
-                responseCode: "(H306)",
+                responseCode: code,
                 responseMessage: message,
               }),
             ],
@@ -294,33 +420,47 @@ describe("HistoryTable literal message rendering (Requirement 6.2)", () => {
         ]}
       />
     )
+    return openDetails()
+  }
 
-    expect(screen.getByText(message)).toBeTruthy()
-    expect(container.querySelector("br")).toBe(null)
+  it("turns the documented (H306) line break into a real break, showing no tag", () => {
+    const drawer = renderMessage("Invalid coupon code.<br/>Please check again.")
+
+    /*
+     * Read from `textContent` rather than through `getByText`, whose default
+     * normalizer collapses the newline this assertion is about.
+     */
+    expect(drawer.textContent).toContain(
+      "Invalid coupon code.\nPlease check again."
+    )
+    // Neither an element nor the tag as text.
+    expect(drawer.querySelector("br")).toBe(null)
+    expect(drawer.textContent).not.toContain("<br")
   })
 
-  it("renders hostile markup as characters, creating no element", () => {
-    const message =
-      '<script>alert("xss")</script><img src=x onerror=alert(1)> Contact support.'
-    const { container } = render(
-      <HistoryTable
-        records={[
-          record({
-            outcomes: [
-              outcome({
-                outcome: "UPSTREAM_ERROR",
-                responseCode: "(H999)",
-                responseMessage: message,
-              }),
-            ],
-          }),
-        ]}
-      />
+  it("removes hostile markup, creating no element and showing no tag", () => {
+    const drawer = renderMessage(
+      '<script>alert("xss")</script><img src=x onerror=alert(1)> Contact support.',
+      "(H999)"
     )
 
-    expect(screen.getByText(message)).toBeTruthy()
-    expect(container.querySelector("script")).toBe(null)
-    expect(container.querySelector("img")).toBe(null)
+    expect(drawer.querySelector("script")).toBe(null)
+    expect(drawer.querySelector("img")).toBe(null)
+    expect(drawer.textContent).not.toContain("<script")
+    expect(drawer.textContent).not.toContain("<img")
+    /*
+     * The tag is gone; the text it wrapped survives as inert characters, which is
+     * more useful to a reader than deleting the sentence with it.
+     */
+    expect(within(drawer).getByText(/Contact support\./)).toBeTruthy()
+  })
+
+  it("shows the placeholder for a message that was nothing but a tag", () => {
+    const drawer = renderMessage("<br/>")
+
+    /* Emptiness is decided after stripping, so this is a dash rather than a blank
+     * line where a reader expects a value. */
+    expect(within(drawer).getAllByText("—").length).toBeGreaterThan(0)
   })
 })
 
@@ -333,7 +473,7 @@ describe("HistoryTable accessibility", () => {
     ).toBeTruthy()
   })
 
-  it("exposes every outcome value as text", () => {
+  it("exposes every outcome value as text in the details drawer", () => {
     render(
       <HistoryTable
         records={[
@@ -359,9 +499,15 @@ describe("HistoryTable accessibility", () => {
         ]}
       />
     )
+    /*
+     * The summary column counts rather than naming outcomes, so the guarantee
+     * that no outcome is conveyed by colour alone now lives in the drawer, where
+     * each value is a text badge.
+     */
+    const drawer = openDetails()
 
-    expect(screen.getByText("SUCCESS")).toBeTruthy()
-    expect(screen.getByText("TRANSPORT_ERROR")).toBeTruthy()
-    expect(screen.getByText("SKIPPED")).toBeTruthy()
+    expect(within(drawer).getByText("SUCCESS")).toBeTruthy()
+    expect(within(drawer).getByText("TRANSPORT_ERROR")).toBeTruthy()
+    expect(within(drawer).getByText("SKIPPED")).toBeTruthy()
   })
 })

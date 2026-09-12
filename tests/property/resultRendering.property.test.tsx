@@ -52,6 +52,7 @@ import {
   RunResultTable,
 } from "@/components/RunResultTable"
 import { countOutcomes } from "@/domain/outcomes"
+import { stripUpstreamMarkup } from "@/domain/upstreamMessage"
 import { MEMBER_OUTCOME_VALUES } from "@/domain/types"
 import type { MemberOutcome } from "@/domain/types"
 
@@ -134,7 +135,13 @@ function messageCell(row: HTMLTableRowElement): HTMLTableCellElement {
 /* Assertions                                                                 */
 /* -------------------------------------------------------------------------- */
 
-/** What Requirement 6.2 says the message cell of `outcome` displays. */
+/**
+ * What the message cell of `outcome` displays: the stored message with its HTML
+ * tags removed, then truncated (Requirement 6.2).
+ *
+ * The order matters and is asserted rather than assumed — stripping first means
+ * the 500-character budget is spent on text rather than on tags.
+ */
 function expectedCellText(outcome: MemberOutcome): string {
   if (
     outcome.outcome !== "UPSTREAM_ERROR" &&
@@ -142,22 +149,31 @@ function expectedCellText(outcome: MemberOutcome): string {
   ) {
     return NO_MESSAGE
   }
-  return outcome.upstreamResult.responseMessage.slice(
+  return stripUpstreamMarkup(outcome.upstreamResult.responseMessage).slice(
     0,
     MAX_DISPLAYED_MESSAGE_CHARS
   )
 }
 
+/** Anything shaped like an HTML tag: `<a…>` or `</a…>`. */
+const TAG_SHAPED = /<\/?[a-z][a-z0-9-]*(?:\s[^>]*)?>/i
+
 /**
- * Requirement 6.2: the message rendered as literal text.
+ * Requirement 6.2: no upstream markup reaches the reader, as markup *or* as
+ * text.
  *
- * The element-descendant check is the load-bearing half. A cell whose message
- * became markup would still answer the right `textContent` — `<br/>` parsed as an
- * element contributes nothing to it — so the property also states that the cell
- * holds text nodes only: no `<br>`, `<script>`, or `<img>`, and in fact no
- * element of any name, because the component adds none of its own here.
+ * Two halves, and both are load-bearing:
+ *
+ *   1. The cell holds text nodes only — no `<br>`, `<script>`, or `<img>`, and in
+ *      fact no element of any name, because the component adds none of its own
+ *      here. This is the injection guarantee, and `textContent` alone cannot
+ *      state it: a cell whose message *became* markup would still answer the
+ *      right `textContent`, since a parsed `<br/>` contributes nothing to it.
+ *   2. No tag survives as visible text either. This is the readability
+ *      guarantee, and it is what changed: the message used to be shown with its
+ *      tags spelled out, and is now shown with them removed.
  */
-function assertLiteralMessageCell(
+function assertNoMarkupReachesTheReader(
   cell: HTMLTableCellElement,
   expectedText: string
 ): void {
@@ -172,6 +188,8 @@ function assertLiteralMessageCell(
   expect(Array.from(cell.childNodes).every((node) => node.nodeType === 3)).toBe(
     true
   )
+  // ...and the reader is not shown a tag instead.
+  expect(TAG_SHAPED.test(cell.textContent)).toBe(false)
 }
 
 /**
@@ -235,9 +253,9 @@ describe("result rendering", () => {
   // Feature: shared-coupon-redemption, Property 20: Result rendering is literal
   // and complete — For any completed Redemption_Run result, the result view
   // renders the response message of every `UPSTREAM_ERROR` and `TRANSPORT_ERROR`
-  // row as literal text with every markup character visible as a character.
+  // row as text holding no HTML tag, and creates no element from it.
   // Validates: Requirements 6.2
-  it("renders every markup character of a message as a visible character", () => {
+  it("shows no upstream tag, as markup or as text", () => {
     fc.assert(
       fc.property(
         resultOutcomesArb({
@@ -257,11 +275,9 @@ describe("result rendering", () => {
               if (outcome.outcome === "SKIPPED") {
                 throw new Error("expected a message-bearing outcome")
               }
-              const message = outcome.upstreamResult.responseMessage
-
-              assertLiteralMessageCell(
+              assertNoMarkupReachesTheReader(
                 messageCell(row),
-                message.slice(0, MAX_DISPLAYED_MESSAGE_CHARS)
+                expectedCellText(outcome)
               )
             })
           })
@@ -274,9 +290,9 @@ describe("result rendering", () => {
   // Feature: shared-coupon-redemption, Property 20: Result rendering is literal
   // and complete — For any completed Redemption_Run result, the result view
   // limits the displayed response message of an `UPSTREAM_ERROR` or
-  // `TRANSPORT_ERROR` row to its first 500 characters.
+  // `TRANSPORT_ERROR` row to 500 characters, counted after its tags are removed.
   // Validates: Requirements 6.2
-  it("limits a displayed message to its first 500 characters", () => {
+  it("limits a displayed message to 500 characters after de-tagging", () => {
     fc.assert(
       fc.property(
         resultOutcomesArb({
@@ -300,14 +316,20 @@ describe("result rendering", () => {
               const cell = messageCell(row)
               // Code units, not graphemes: `slice` is what the component does,
               // so a truncated surrogate pair is expected, not rounded away.
-              expect(cell.textContent).toBe(
-                message.slice(0, MAX_DISPLAYED_MESSAGE_CHARS)
+              expect(cell.textContent).toBe(expectedCellText(outcome))
+              /*
+               * At most the cap — not exactly it. A message this long may be
+               * mostly tags, and removing them can leave fewer than 500
+               * characters to show.
+               */
+              expect(cell.textContent.length).toBeLessThanOrEqual(
+                MAX_DISPLAYED_MESSAGE_CHARS
               )
-              expect(cell.textContent).toHaveLength(MAX_DISPLAYED_MESSAGE_CHARS)
               // The characters beyond the cap are gone from the page, tail
               // markup included.
               expect(cell.textContent).not.toBe(message)
               expect(cell.querySelectorAll("*")).toHaveLength(0)
+              expect(TAG_SHAPED.test(cell.textContent)).toBe(false)
             })
           })
         }
@@ -338,7 +360,7 @@ describe("result rendering", () => {
             // displayable message — `SKIPPED` included, whose `upstreamResult`
             // is null — shows the placeholder, never a message.
             resultRows(container).forEach((row, position) => {
-              assertLiteralMessageCell(
+              assertNoMarkupReachesTheReader(
                 messageCell(row),
                 expectedCellText(outcomes[position])
               )
