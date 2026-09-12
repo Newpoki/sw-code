@@ -3,7 +3,15 @@ node_modules
 dist
 dist-ssr
 *.local
+
+# environment: secrets stay local, the documented template stays tracked
+.env
 .env*
+!.env.example
+
+# runtime JSON store (DATA_FILE), created on first write
+data/
+
 .tanstack
 .wrangler
 .output
