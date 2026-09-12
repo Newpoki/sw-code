@@ -38,6 +38,33 @@ them. `hiveid` and `coupon` are supplied per Redemption_Run.
 Every group member plays on the `europe` server with `en` as language and `FR` as country, which is
 why those three values are constants of the application rather than inputs.
 
+### Required request headers
+
+Two headers are **mandatory**, enforced by the edge CDN in front of the Upstream_API rather than by
+the coupon service itself:
+
+| Header | Value |
+| --- | --- |
+| `referer` | The event page, i.e. the base URL above |
+| `x-requested-with` | `XMLHttpRequest` |
+
+Each is necessary and together they are sufficient; `user-agent` and `origin` make no difference and
+are not sent. Omitting either one produces **HTTP 403 with an HTML error page**, which the
+Response_Parser correctly reports as `TRANSPORT_ERROR` / "response body is not valid JSON" — so a
+blocked request looks exactly like a malformed one. Measured against the live endpoint:
+
+| Headers sent | Result |
+| --- | --- |
+| `content-type` only | 403, HTML |
+| `+ user-agent` | 403, HTML |
+| `+ user-agent`, `origin` | 403, HTML |
+| `+ origin`, `x-requested-with` | 403, HTML |
+| `referer` + `x-requested-with` | 200, JSON |
+
+Note that a successful response is served with `content-type: text/html` despite carrying a JSON
+body. The Response_Parser ignores the response content type and parses the body, so this is
+harmless — but a future rewrite must not start trusting that header.
+
 `hiveid` changes for each Group_Member within one Redemption_Run; `coupon` holds the same value for
 the whole Redemption_Run.
 
@@ -85,7 +112,11 @@ Web_Client renders such a message as visible text and never as markup (Requireme
 | `(H304)` | `ALREADY_USED` | `fixtures/upstream/already-used-h304.json` |
 | `(H306)` | `INVALID_COUPON` | `fixtures/upstream/invalid-coupon-h306.json` |
 
-Any other non-empty normalized response code yields `UPSTREAM_ERROR`. A response that is absent,
+Any other non-empty normalized response code yields `UPSTREAM_ERROR`, and such codes do occur: a
+Hive_ID the service does not recognize is answered with `retCode` `503` and `retMsg`
+`Invalid Hive ID.<br/>Please check again.`, which the Response_Parser classifies as `UPSTREAM_ERROR`
+and the Web_Client displays verbatim. It is not mirrored by a fixture because Mock_Mode only needs
+the three outcomes above. A response that is absent,
 larger than 64 KiB, not valid JSON, without a `retCode` field, or with a `retCode` that is neither a
 number nor a string yields `TRANSPORT_ERROR` (Requirements 4.5, 4.6).
 

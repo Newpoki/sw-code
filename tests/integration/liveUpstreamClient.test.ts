@@ -7,7 +7,9 @@ import {
   UPSTREAM_TIMEOUT_MS,
   USE_COUPON_CONTENT_TYPE,
   USE_COUPON_PATH,
+  XHR_HEADER_VALUE,
   createLiveUpstreamClient,
+  useCouponReferer,
 } from "@/server/upstream/live.server"
 
 /**
@@ -29,6 +31,14 @@ interface ObservedRequest {
   readonly method: string
   readonly url: string
   readonly contentType: string | undefined
+  /**
+   * The two headers the Upstream_API's edge CDN requires. Captured because
+   * dropping either one makes the live endpoint answer 403 with HTML, which
+   * reaches the Response_Parser as "response body is not valid JSON" and is
+   * indistinguishable from a genuinely malformed body.
+   */
+  readonly requestedWith: string | undefined
+  readonly referer: string | undefined
   /** URL-encoded body exactly as it arrived. */
   readonly rawBody: string
 }
@@ -36,6 +46,14 @@ interface ObservedRequest {
 interface TestServer {
   readonly baseUrl: string
   readonly requests: ReadonlyArray<ObservedRequest>
+}
+
+/**
+ * One header value. `node:http` types a repeatable header as an array, and this
+ * client sends each of these exactly once, so the first value is the value.
+ */
+function singleHeader(raw: string | string[] | undefined): string | undefined {
+  return Array.isArray(raw) ? raw[0] : raw
 }
 
 /** Decides what the local server does with a fully received request. */
@@ -65,6 +83,8 @@ async function startServer(respond: Responder): Promise<TestServer> {
         method: req.method ?? "",
         url: req.url ?? "",
         contentType: req.headers["content-type"],
+        requestedWith: singleHeader(req.headers["x-requested-with"]),
+        referer: req.headers.referer,
         rawBody: Buffer.concat(chunks).toString("utf8"),
       }
       requests.push(observed)
@@ -178,6 +198,25 @@ describe("the five request fields reach the endpoint (Requirement 3.3)", () => {
     expect(fields.get("server")).toBe(FIXED_REQUEST_FIELDS.server)
     expect(fields.get("hiveid")).toBe(HIVE_ID)
     expect(fields.get("coupon")).toBe(COUPON)
+  })
+
+  it("sends the two headers the upstream edge requires, or it answers 403 with HTML", async () => {
+    const server = await echoServer()
+    const client = new LiveUpstreamClient({ baseUrl: server.baseUrl })
+
+    await client.useCoupon({ hiveid: HIVE_ID, coupon: COUPON })
+
+    const observed = onlyRequest(server)
+    /*
+     * Measured against the live endpoint: `referer` and `x-requested-with` are
+     * each necessary and together sufficient. Dropping either one turns every
+     * redemption into a TRANSPORT_ERROR, so both are pinned here rather than
+     * left to a reviewer's judgement about which headers look superfluous.
+     */
+    expect(observed.requestedWith).toBe(XHR_HEADER_VALUE)
+    expect(observed.referer).toBe(useCouponReferer(server.baseUrl))
+    // The referer names the host actually being called, not a hardcoded one.
+    expect(observed.referer).toBe(server.baseUrl)
   })
 
   it("returns the raw body text unchanged with its status and no failure", async () => {

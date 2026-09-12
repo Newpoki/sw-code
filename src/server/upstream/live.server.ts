@@ -24,6 +24,13 @@
  * defect in this client rather than an upstream condition, so the two failure
  * modes are converted here and nowhere else.
  *
+ * ## Two headers are load-bearing
+ *
+ * `referer` and `x-requested-with` are **required by the Upstream_API's edge
+ * CDN**, which answers 403 with an HTML error page when either is missing — so
+ * the coupon service is never reached and the Response_Parser sees HTML. See
+ * {@link XHR_HEADER_NAME} for the measured header matrix and the reasoning.
+ *
  * ## Body encoding
  *
  * The official event page submits a form, so the body is
@@ -59,6 +66,44 @@ export const UPSTREAM_TIMEOUT_MS = 10_000
 /** Body encoding of a `useCoupon` request; the official page posts a form. */
 export const USE_COUPON_CONTENT_TYPE =
   "application/x-www-form-urlencoded;charset=UTF-8"
+
+/**
+ * The two request headers the Upstream_API's edge CDN requires, without which it
+ * answers **HTTP 403 with an HTML error page** instead of reaching the coupon
+ * service at all.
+ *
+ * ## Do not remove these, and do not "simplify" them
+ *
+ * They look like browser cargo-culting. They are not: the behaviour was measured
+ * against the live endpoint, and the requirement is exactly this pair.
+ *
+ * | Headers sent | Result |
+ * | --- | --- |
+ * | `content-type` only | 403, HTML |
+ * | `+ user-agent` | 403, HTML |
+ * | `+ user-agent`, `origin` | 403, HTML |
+ * | `+ origin`, `x-requested-with` | 403, HTML |
+ * | **`referer` + `x-requested-with`** | **200, JSON** |
+ *
+ * Both are necessary and together they are sufficient. `user-agent` and `origin`
+ * make no difference either way, so neither is sent — a spoofed `user-agent`
+ * would be a fingerprint this client has no reason to claim.
+ *
+ * This is also why the failure was hard to read from the outside: the edge
+ * returns HTML, the Response_Parser correctly reports "response body is not
+ * valid JSON", and the HTTP status never reaches the message, so a blocked
+ * request is indistinguishable from a genuinely malformed body.
+ *
+ * `x-requested-with` marks the call as the same XHR the official event page
+ * makes; `referer` must name that event page, which is the Upstream_API base URL
+ * itself, so it is derived from `baseUrl` by {@link useCouponReferer} rather than
+ * hardcoded — an overridden `UPSTREAM_BASE_URL` (a local echo server in a test,
+ * a staging host) then stays self-consistent instead of pointing at production.
+ */
+export const XHR_HEADER_NAME = "x-requested-with"
+
+/** Value `x-requested-with` carries, as the official event page sends it. */
+export const XHR_HEADER_VALUE = "XMLHttpRequest"
 
 /**
  * The Fixed_Request_Fields (Requirement 3.3). Constants of the application: a
@@ -112,6 +157,18 @@ export interface LiveUpstreamClientOptions {
  */
 export function useCouponEndpoint(baseUrl: string): string {
   return `${baseUrl.replace(/\/+$/, "")}/${USE_COUPON_PATH}`
+}
+
+/**
+ * The `referer` a `useCoupon` request carries: the event page the official
+ * client posts from, which is the Upstream_API base URL itself.
+ *
+ * Derived from `baseUrl` rather than hardcoded, so overriding
+ * `UPSTREAM_BASE_URL` keeps the referer pointing at the host actually being
+ * called. See {@link XHR_HEADER_NAME} for why this header is mandatory.
+ */
+export function useCouponReferer(baseUrl: string): string {
+  return baseUrl.replace(/\/+$/, "")
 }
 
 /**
@@ -213,6 +270,10 @@ export class LiveUpstreamClient implements UpstreamClient {
         headers: {
           "content-type": USE_COUPON_CONTENT_TYPE,
           accept: "application/json",
+          /* Both mandatory: without them the edge CDN answers 403 with HTML and
+           * the coupon service is never reached. See XHR_HEADER_NAME. */
+          [XHR_HEADER_NAME]: XHR_HEADER_VALUE,
+          referer: useCouponReferer(this.baseUrl),
         },
         body: buildUseCouponBody(req),
         signal,
