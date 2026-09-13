@@ -54,9 +54,7 @@
  * Validates: Requirements 2.10, 3.7
  */
 
-import { randomUUID } from "node:crypto"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { createInMemoryMongoStore } from "../support/inMemoryMongoStore"
 
 import fc from "fast-check"
 import { describe, expect, it } from "vitest"
@@ -70,10 +68,10 @@ import {
 } from "@/server/run/redemptionRequest.server"
 import { createRunCoordinator } from "@/server/run/coordinator.server"
 import { createHistoryStore } from "@/server/store/history.server"
-import { createJsonStore } from "@/server/store/jsonStore.server"
 import { createMemberRegistryStore } from "@/server/store/memberRegistry.server"
 import type {
   MemberRegistryEntry,
+  RedemptionHistoryRecord,
   RedemptionRunResult,
   RunEvent,
 } from "@/domain/types"
@@ -232,15 +230,11 @@ interface Harness {
 async function createHarness(
   roster: readonly MemberRegistryEntry[]
 ): Promise<Harness> {
-  const store = createJsonStore({
-    dataFilePath: join(
-      tmpdir(),
-      `scr-coupon-rejection-${randomUUID()}`,
-      "store.json"
-    ),
-    flush: () => Promise.resolve(),
-    logger: { warn: () => undefined },
-  })
+  const handle = createInMemoryMongoStore()
+  /* The in-memory Mongo_Store of `tests/support/inMemoryMongoStore.ts`: no
+   * deployment and no file, and every operation served, so a `failed` result
+   * anywhere below is a genuine falsification. */
+  const store = handle.store
 
   let nextId = 0
   const registry = createMemberRegistryStore(store, {
@@ -271,7 +265,11 @@ async function createHarness(
     }
   }
 
-  const fixedList = registry.listEnabled()
+  const enabledListing = await registry.listEnabled()
+  if (enabledListing.kind !== "entries") {
+    throw new Error(`the enabled roster read reported "${enabledListing.kind}"`)
+  }
+  const fixedList = enabledListing.entries
   const history = createHistoryStore(store)
   const upstream = new StubUpstreamClient({
     script: fixedList.map(() =>
@@ -326,6 +324,28 @@ function expectEveryCountZero(result: RedemptionRunResult): void {
   }
 }
 
+/** The stored roster in position order, or a thrown explanation. */
+async function rosterOf(
+  registry: MemberRegistryStore
+): Promise<readonly MemberRegistryEntry[]> {
+  const listed = await registry.list()
+  if (listed.kind !== "entries") {
+    throw new Error(`the roster read reported "${listed.kind}"`)
+  }
+  return listed.entries
+}
+
+/** The stored Redemption_History, or a thrown explanation. */
+async function historyOf(
+  history: HistoryStore
+): Promise<readonly RedemptionHistoryRecord[]> {
+  const listed = await history.list()
+  if (listed.kind !== "records") {
+    throw new Error(`the history read reported "${listed.kind}"`)
+  }
+  return listed.records
+}
+
 /* -------------------------------------------------------------------------- */
 /* Property                                                                   */
 /* -------------------------------------------------------------------------- */
@@ -363,8 +383,8 @@ describe("out-of-range Coupon_Code rejection", () => {
           expect(harness.fixedList.length).toBeGreaterThan(0)
           expect(harness.fixedList).toHaveLength(enabledEntries(roster).length)
 
-          const rosterBefore = harness.registry.list()
-          const historyBefore = harness.history.list()
+          const rosterBefore = await rosterOf(harness.registry)
+          const historyBefore = await historyOf(harness.history)
           expect(historyBefore).toEqual([])
 
           const events = await harness.submit(payload)
@@ -399,7 +419,7 @@ describe("out-of-range Coupon_Code rejection", () => {
             expect(harness.upstream.requests).toEqual([])
 
             // Requirements 2.10, 3.7: the Redemption_History unchanged.
-            expect(harness.history.list()).toEqual([])
+            expect(await historyOf(harness.history)).toEqual([])
           } else {
             // The complement, so the rejection branch above cannot be satisfied
             // by a Redemption_Server that turns every submission away.
@@ -413,14 +433,13 @@ describe("out-of-range Coupon_Code rejection", () => {
 
             // One request per enabled Group_Member, and one history record.
             expect(harness.upstream.callCount).toBe(harness.fixedList.length)
-            expect(harness.history.list()).toHaveLength(1)
-            expect(harness.history.list()[0]?.couponCode).toBe(
-              verdict.echoedCouponCode
-            )
+            const historyAfter = await historyOf(harness.history)
+            expect(historyAfter).toHaveLength(1)
+            expect(historyAfter[0]?.couponCode).toBe(verdict.echoedCouponCode)
           }
 
           // Neither branch touches the roster.
-          expect(harness.registry.list()).toEqual(rosterBefore)
+          expect(await rosterOf(harness.registry)).toEqual(rosterBefore)
         }
       ),
       { numRuns: 100 }

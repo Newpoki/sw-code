@@ -46,9 +46,7 @@
  * Validates: Requirements 5.1, 5.2, 5.3, 5.5
  */
 
-import { randomUUID } from "node:crypto"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { createInMemoryMongoStore } from "../support/inMemoryMongoStore"
 
 import fc from "fast-check"
 import { describe, expect, it } from "vitest"
@@ -56,13 +54,13 @@ import { describe, expect, it } from "vitest"
 import { parseUpstreamBody } from "@/domain/responseParser"
 import type {
   MemberRegistryEntry,
+  RedemptionHistoryRecord,
   RedemptionRunResult,
   RunEvent,
 } from "@/domain/types"
 import { createRunCoordinator } from "@/server/run/coordinator.server"
 import { createHistoryStore } from "@/server/store/history.server"
 import type { HistoryStore } from "@/server/store/history.server"
-import { createJsonStore } from "@/server/store/jsonStore.server"
 import { createMemberRegistryStore } from "@/server/store/memberRegistry.server"
 import type { MemberRegistryStore } from "@/server/store/memberRegistry.server"
 
@@ -271,6 +269,39 @@ function freshHiveId(taken: ReadonlySet<string>): string {
   return candidate
 }
 
+/** The roster in position order, or a thrown explanation. */
+async function rosterOf(
+  registry: MemberRegistryStore
+): Promise<readonly MemberRegistryEntry[]> {
+  const listed = await registry.list()
+  if (listed.kind !== "entries") {
+    throw new Error(`the roster read reported "${listed.kind}"`)
+  }
+  return listed.entries
+}
+
+/** The enabled entries in position order — the fixed list of a run. */
+async function enabledRosterOf(
+  registry: MemberRegistryStore
+): Promise<readonly MemberRegistryEntry[]> {
+  const listed = await registry.listEnabled()
+  if (listed.kind !== "entries") {
+    throw new Error(`the enabled roster read reported "${listed.kind}"`)
+  }
+  return listed.entries
+}
+
+/** The retained Redemption_History records, or a thrown explanation. */
+async function recordsOf(
+  history: HistoryStore
+): Promise<readonly RedemptionHistoryRecord[]> {
+  const listed = await history.list()
+  if (listed.kind !== "records") {
+    throw new Error(`the history read reported "${listed.kind}"`)
+  }
+  return listed.records
+}
+
 /**
  * Applies the four mutations of Requirement 5.5 to a Member_Registry whose run
  * is in progress: an entry joins, an unprocessed entry leaves, another
@@ -286,7 +317,9 @@ async function applyMutation(
   plan: MutationPlan,
   applied: AppliedMutation
 ): Promise<void> {
-  const hiveId = freshHiveId(new Set(registry.list().map((e) => e.hiveId)))
+  const hiveId = freshHiveId(
+    new Set((await rosterOf(registry)).map((e) => e.hiveId))
+  )
   const added = await registry.add({ memberLabel: MID_RUN_LABEL, hiveId })
   if (added.kind !== "added") {
     throw new Error(`mid-run add was rejected as ${added.kind}`)
@@ -331,15 +364,11 @@ async function applyMutation(
  * (Requirements 1.1, 1.6, 1.9).
  */
 async function createHarness(testCase: EarlyStopCase): Promise<Harness> {
-  const store = createJsonStore({
-    dataFilePath: join(
-      tmpdir(),
-      `scr-early-stop-${randomUUID()}`,
-      "store.json"
-    ),
-    flush: () => Promise.resolve(),
-    logger: { warn: () => undefined },
-  })
+  const handle = createInMemoryMongoStore()
+  /* The in-memory Mongo_Store of `tests/support/inMemoryMongoStore.ts`: no
+   * deployment and no file, and every operation served, so a `failed` result
+   * anywhere below is a genuine falsification. */
+  const store = handle.store
 
   let nextId = 0
   const registry = createMemberRegistryStore(store, {
@@ -372,8 +401,8 @@ async function createHarness(testCase: EarlyStopCase): Promise<Harness> {
 
   // Read before the run: this is the list the coordinator fixes at run start,
   // and the roster the generated mutation targets are indexed against.
-  const snapshot = registry.listEnabled()
-  const rosterBefore = registry.list()
+  const snapshot = await enabledRosterOf(registry)
+  const rosterBefore = await rosterOf(registry)
   const applied: AppliedMutation = {
     addedHiveIds: [],
     removedHiveIds: [],
@@ -407,7 +436,7 @@ async function createHarness(testCase: EarlyStopCase): Promise<Harness> {
           },
   })
 
-  const history = createHistoryStore(store)
+  const history = createHistoryStore(store, { logger: handle.logger })
   const coordinator = createRunCoordinator({ registry, history, upstream })
 
   return {
@@ -507,7 +536,7 @@ describe("Redemption_Run early stop on INVALID_COUPON", () => {
 
         /* Requirement 5.7: an early stop is a completed run, recorded once. */
         expect(result.stoppedEarly).toBe(true)
-        const records = harness.history.list()
+        const records = await recordsOf(harness.history)
         expect(records).toHaveLength(1)
         expect(records[0].couponCode).toBe(testCase.couponCode)
         expect(records[0].stoppedEarly).toBe(true)
@@ -572,7 +601,9 @@ describe("Redemption_Run early stop on INVALID_COUPON", () => {
         expect(addedHiveIds).toHaveLength(1)
         expect(removedHiveIds).toHaveLength(1)
 
-        const rosterAfter = harness.registry.list().map((entry) => entry.hiveId)
+        const rosterAfter = (await rosterOf(harness.registry)).map(
+          (entry) => entry.hiveId
+        )
         expect(rosterAfter).toContain(addedHiveIds[0])
         expect(rosterAfter).not.toContain(removedHiveIds[0])
 

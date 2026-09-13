@@ -35,29 +35,25 @@
  * measured value in the failure message. The tight bound is a canary; the
  * 1-second bound is the contract.
  *
- * ## Two flush strategies, one loop
+ * ## Two store strategies, one loop
  *
  * The coordinator appends the Redemption_History record *before* it yields
  * `run-completed`, so the durable write is inside the measured window. Both
  * halves of that are measured:
  *
- *   - an injected flush that resolves immediately, which keeps the measurement
- *     about the run loop itself, and
- *   - the real {@link atomicFlush} into a temporary directory, which is what a
- *     deployment actually pays (write, `fsync`, `rename`).
+ *   - the in-memory Mongo_Store of `tests/support/inMemoryMongoStore.ts`, whose
+ *     write resolves without a round trip, which keeps the measurement about the
+ *     run loop itself, and
+ *   - a real MongoDB write through the `tests/support/mongoFixture.ts` throwaway
+ *     database, which is what a deployment actually pays (the insert's round
+ *     trip). That half skips, with a stated reason, when no deployment is
+ *     configured.
  *
  * Both must clear the bound; if they did not, the requirement would only hold
  * for a store nobody runs.
- *
- * `./data/store.json` is never touched: every store here is built over a path
- * inside a `mkdtemp` directory that `afterEach` removes.
  */
 
-import { mkdtemp, rm } from "node:fs/promises"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
-
-import { afterEach, describe, expect, it } from "vitest"
+import { afterAll, describe, expect, it } from "vitest"
 
 import { MEMBER_OUTCOME_VALUES } from "@/domain/types"
 import type {
@@ -67,11 +63,17 @@ import type {
 } from "@/domain/types"
 import { createRunCoordinator } from "@/server/run/coordinator.server"
 import { createHistoryStore } from "@/server/store/history.server"
-import { atomicFlush, createJsonStore } from "@/server/store/jsonStore.server"
-import type { FlushFn } from "@/server/store/jsonStore.server"
 import { createMemberRegistryStore } from "@/server/store/memberRegistry.server"
+import type { MongoStore } from "@/server/store/mongo.server"
 
 import { FIXTURE_BODIES } from "../property/generators"
+import { createInMemoryMongoStore } from "../support/inMemoryMongoStore"
+import {
+  closeMongoFixture,
+  mongoAvailability,
+  mongoSkipReason,
+  withThrowawayDatabase,
+} from "../support/mongoFixture"
 import {
   StubUpstreamClient,
   respondWithBody,
@@ -93,24 +95,6 @@ const REQUIRED_BOUND_MS = 1000
 const SANITY_BOUND_MS = 250
 
 const COUPON_CODE = "EARLYSTOPBOUND"
-
-/** Directories created by {@link temporaryDataFile}, removed after each test. */
-const temporaryDirectories: Array<string> = []
-
-afterEach(async () => {
-  while (temporaryDirectories.length > 0) {
-    const directory = temporaryDirectories.pop()
-    if (directory === undefined) continue
-    await rm(directory, { recursive: true, force: true })
-  }
-})
-
-/** A `DATA_FILE` path inside a fresh temporary directory. */
-async function temporaryDataFile(): Promise<string> {
-  const directory = await mkdtemp(join(tmpdir(), "scr-early-stop-bound-"))
-  temporaryDirectories.push(directory)
-  return join(directory, "store.json")
-}
 
 /** What one measured Redemption_Run produced. */
 interface Measured {
@@ -137,14 +121,7 @@ interface Measured {
  * roster write is still pending when the measured window opens — the only write
  * inside the window is the run's own history record.
  */
-async function measureEarlyStop(flush?: FlushFn): Promise<Measured> {
-  const dataFilePath = await temporaryDataFile()
-  const store = createJsonStore({
-    dataFilePath,
-    ...(flush === undefined ? {} : { flush }),
-    logger: { warn: () => undefined },
-  })
-
+async function measureEarlyStop(store: MongoStore): Promise<Measured> {
   let nextId = 0
   const registry = createMemberRegistryStore(store, {
     generateId: () => {
@@ -164,9 +141,12 @@ async function measureEarlyStop(flush?: FlushFn): Promise<Measured> {
       throw new Error(`could not seed roster entry ${label}: ${added.kind}`)
     }
   }
-  await store.whenIdle()
 
-  const fixedList = registry.listEnabled()
+  const enabledListing = await registry.listEnabled()
+  if (enabledListing.kind !== "entries") {
+    throw new Error(`the enabled roster read reported "${enabledListing.kind}"`)
+  }
+  const fixedList = enabledListing.entries
   if (fixedList.length !== ROSTER_SIZE) {
     throw new Error(
       `expected ${ROSTER_SIZE} enabled Group_Members, got ${fixedList.length}`
@@ -214,14 +194,17 @@ async function measureEarlyStop(flush?: FlushFn): Promise<Measured> {
     throw new Error("the run produced no terminal event")
   }
 
-  await store.whenIdle()
+  const listed = await history.list()
+  if (listed.kind !== "records") {
+    throw new Error(`the history read reported "${listed.kind}"`)
+  }
 
   return {
     terminalType: terminal.type,
     result: terminal.result,
     elapsedMs: terminalAt - invalidCouponAt,
     callCount: upstream.callCount,
-    historyRecords: history.list(),
+    historyRecords: listed.records,
   }
 }
 
@@ -283,21 +266,43 @@ function expectWithinBound(elapsedMs: number, label: string): void {
   ).toBeLessThan(SANITY_BOUND_MS)
 }
 
+const mongo = await mongoAvailability()
+
+afterAll(closeMongoFixture)
+
 describe("early-stop response bound (Requirement 5.7)", () => {
-  it("returns the complete result set as a success within 1 second of the INVALID_COUPON, with the store write injected", async () => {
-    const measured = await measureEarlyStop(() => Promise.resolve())
+  it("returns the complete result set as a success within 1 second of the INVALID_COUPON, over an in-memory store", async () => {
+    // The in-memory Mongo_Store of `tests/support/inMemoryMongoStore.ts`: its
+    // writes resolve without a round trip, which keeps the measurement about the
+    // run loop itself.
+    const handle = createInMemoryMongoStore({
+      logger: { warn: () => undefined },
+    })
+    const measured = await measureEarlyStop(handle.store)
 
     expectCompleteEarlyStopResult(measured)
-    expectWithinBound(measured.elapsedMs, "injected flush")
+    expectWithinBound(measured.elapsedMs, "in-memory store")
   })
 
-  it("returns the complete result set as a success within 1 second of the INVALID_COUPON, with the real atomic store write", async () => {
-    // The real flush: write the temporary file, `fsync` it, rename it over the
-    // data file. A deployment pays this inside the measured window, so the bound
-    // has to hold with it too.
-    const measured = await measureEarlyStop(atomicFlush)
+  it.skipIf(!mongo.available)(
+    "returns the complete result set as a success within 1 second of the INVALID_COUPON, over a real MongoDB write",
+    async () => {
+      // The real durable write: a deployment pays the insert's round trip inside
+      // the measured window, so the bound has to hold with it too.
+      await withThrowawayDatabase(async (sample) => {
+        const store = await sample.createStore()
+        const measured = await measureEarlyStop(store)
 
-    expectCompleteEarlyStopResult(measured)
-    expectWithinBound(measured.elapsedMs, "real atomic flush")
-  })
+        expectCompleteEarlyStopResult(measured)
+        expectWithinBound(measured.elapsedMs, "real MongoDB write")
+      })
+    }
+  )
+
+  it.runIf(!mongo.available)(
+    `skipped: the real MongoDB write bound needs a deployment — ${mongoSkipReason(mongo) ?? ""}`,
+    () => {
+      expect(mongo.available).toBe(false)
+    }
+  )
 })

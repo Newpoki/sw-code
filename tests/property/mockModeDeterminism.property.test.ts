@@ -43,10 +43,8 @@
  * Validates: Requirements 7.3, 7.9
  */
 
-import { randomUUID } from "node:crypto"
+import { createInMemoryMongoStore } from "../support/inMemoryMongoStore"
 import { readFileSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 
 import fc from "fast-check"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
@@ -60,7 +58,6 @@ import type {
 import { createRunCoordinator } from "@/server/run/coordinator.server"
 import { createHistoryStore } from "@/server/store/history.server"
 import type { HistoryStore } from "@/server/store/history.server"
-import { createJsonStore } from "@/server/store/jsonStore.server"
 import { createMemberRegistryStore } from "@/server/store/memberRegistry.server"
 import type { MemberRegistryStore } from "@/server/store/memberRegistry.server"
 import {
@@ -224,11 +221,11 @@ function recordingMockClient(): RecordingMockClient {
 async function seedStores(
   roster: readonly MemberRegistryEntry[]
 ): Promise<{ registry: MemberRegistryStore; history: HistoryStore }> {
-  const store = createJsonStore({
-    dataFilePath: join(tmpdir(), `scr-mock-mode-${randomUUID()}`, "store.json"),
-    flush: () => Promise.resolve(),
-    logger: { warn: () => undefined },
-  })
+  const handle = createInMemoryMongoStore()
+  /* The in-memory Mongo_Store of `tests/support/inMemoryMongoStore.ts`: no
+   * deployment and no file, and every operation served, so a `failed` result
+   * anywhere below is a genuine falsification. */
+  const store = handle.store
 
   let nextId = 0
   const registry = createMemberRegistryStore(store, {
@@ -422,7 +419,11 @@ describe("Mock_Mode determinism", () => {
 
         // Requirement 7.9: every appended Redemption_History record is marked as
         // derived from mock data.
-        const records = history.list()
+        const listed = await history.list()
+        if (listed.kind !== "records") {
+          throw new Error(`the history read reported "${listed.kind}"`)
+        }
+        const records = listed.records
         expect(records).toHaveLength(3)
         for (const record of records) {
           expect(record.mock).toBe(true)

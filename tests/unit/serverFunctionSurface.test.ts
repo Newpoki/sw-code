@@ -154,11 +154,18 @@ describe("the roster re-reads only after a successful mutation", () => {
     return roster.slice(start, end)
   }
 
+  /*
+   * The re-read is the injected `revalidate` seam, which the route component
+   * wires to `router.invalidate()`. The page depends on "re-read the roster"
+   * rather than on the router (so it renders in a test with no router mounted),
+   * so a handler calls `revalidate()` and the binding to `router.invalidate()`
+   * is asserted once, at the wrapper, below.
+   */
   for (const name of ["handleAdd", "handleSetEnabled", "handleRemove"]) {
     it(`${name} invalidates the roster read, and only on success`, () => {
       const body = handlerBody(name)
 
-      const invalidate = body.indexOf("router.invalidate()")
+      const invalidate = body.indexOf("revalidate()")
       expect(
         invalidate,
         `${name} must re-read the roster after the write lands (Requirement 1.4)`
@@ -177,6 +184,16 @@ describe("the roster re-reads only after a successful mutation", () => {
       ).toBeLessThan(invalidate)
     })
   }
+
+  it("wires the injected revalidate seam to router.invalidate()", () => {
+    /* The one place the router is reached: the route component's `revalidate`
+     * prop is `router.invalidate()`, so the handlers' `revalidate()` re-reads
+     * the roster (Requirement 1.4). */
+    expect(
+      roster,
+      "roster.tsx must bind the revalidate seam to router.invalidate()"
+    ).toMatch(/revalidate=\{[\s\S]*?router\.invalidate\(\)/)
+  })
 })
 
 describe("the run state machine is the only source of the disabled state", () => {

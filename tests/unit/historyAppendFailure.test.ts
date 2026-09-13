@@ -1,10 +1,12 @@
 /**
- * The history-append failure warning (Requirement 6.8).
+ * The history-append failure warning (Requirement 6.8 of the
+ * shared-coupon-redemption spec, superseded in wording by Requirement 3.7 of the
+ * mongodb-google-auth-admin spec).
  *
  * Requirement 6.8 is a *both* claim, not a single one: when appending the
  * Redemption_History record fails, the Member_Outcomes of the completed
- * Redemption_Run still come back **and** a warning states that the record is not
- * persisted. A test that only checked the warning would pass against a
+ * Redemption_Run still come back **and** exactly one warning states that the
+ * record was not saved. A test that only checked the warning would pass against a
  * coordinator that dropped the result set, and a test that only checked the
  * outcomes would pass against one that stayed silent. So every case below
  * asserts the complete result set — one Member_Outcome per fixed-list entry,
@@ -14,37 +16,32 @@
  *
  * Four cases, because "the append failed" has more than one shape:
  *
- *   1. A store whose flush rejects. `HistoryStore.append` resolves with
- *      `persisted: false`, which is the ordinary full-disk case.
- *   2. The complement: the same run with a flush that lands yields
- *      `warnings: []` and one appended record reporting `persisted: true`. This
- *      is what proves the warning accompanies only the failing case rather than
- *      being attached to every run.
+ *   1. A deployment that refuses the `insertOne`. `HistoryStore.append` resolves
+ *      with `failed`, which is the ordinary Requirement 3.7 case: nothing was
+ *      written, not even partially, and the retention trim is never reached.
+ *   2. The complement: the same run against a deployment that serves the insert
+ *      yields `warnings: []` and one stored record. This is what proves the
+ *      warning accompanies only the failing case rather than being attached to
+ *      every run.
  *   3. A `HistoryStore` whose `append` rejects outright. The coordinator catches
  *      it (`appendHistoryRecord`), so the run still ends in `run-completed`, the
  *      outcomes survive, and the same single warning is produced. Nothing
  *      escapes to the consumer as an error.
- *   4. An early-stop run (a scripted `INVALID_COUPON`) with a rejecting flush:
- *      the `SKIPPED` Member_Outcomes are returned alongside the single warning.
+ *   4. An early-stop run (a scripted `INVALID_COUPON`) against the same refusing
+ *      deployment: the `SKIPPED` Member_Outcomes are returned alongside the
+ *      single warning.
  *
- * **Seeding noise.** The roster is seeded through the same `JsonStore`, so a
- * rejecting flush would also make every roster add report `persisted: false` and
- * log its own warning. This test takes the first of the two options: the flush
- * resolves while the roster is seeded and is switched to rejecting afterwards,
- * through a mutable flag inside the injected flush. Every seeding add is
- * asserted to be persisted and the logger is asserted to be silent before the
- * run starts, so the store warnings counted afterwards belong to the history
- * append alone.
+ * **No seeding noise to work around.** The roster and the Redemption_History are
+ * two collections of one in-memory Mongo_Store, and a rejection is injected per
+ * collection and per method — so `history.insertOne` can refuse while every
+ * roster write keeps working. The failure is therefore installed once, up front,
+ * and every seeding add is still asserted to have landed.
  *
- * No filesystem is touched. The flush is injected, so the temporary
- * `dataFilePath` is never created, never read, and never written — and the
- * repository's own `./data/store.json` is never referenced at all.
+ * No filesystem and no deployment is touched: the store is the in-memory
+ * {@link MongoStore} of `tests/support/inMemoryMongoStore.ts`.
  */
 
-import { randomUUID } from "node:crypto"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
-
+import { MongoServerError } from "mongodb"
 import { describe, expect, it } from "vitest"
 
 import { parseUpstreamBody } from "@/domain/responseParser"
@@ -52,6 +49,7 @@ import type {
   MemberOutcomeValue,
   MemberRegistryEntry,
   OutcomeCounts,
+  RedemptionHistoryRecord,
   RedemptionRunResult,
   RunEvent,
 } from "@/domain/types"
@@ -62,9 +60,9 @@ import {
 import { createHistoryStore } from "@/server/store/history.server"
 import type {
   AppendHistoryInput,
+  AppendHistoryResult,
   HistoryStore,
 } from "@/server/store/history.server"
-import { createJsonStore } from "@/server/store/jsonStore.server"
 import { createMemberRegistryStore } from "@/server/store/memberRegistry.server"
 import type { MemberRegistryStore } from "@/server/store/memberRegistry.server"
 
@@ -74,6 +72,8 @@ import {
   respondWithTransportFailure,
 } from "../support/stubUpstreamClient"
 import type { StubScriptEntry } from "../support/stubUpstreamClient"
+import { createInMemoryMongoStore } from "../support/inMemoryMongoStore"
+import type { InMemoryMongoStoreHandle } from "../support/inMemoryMongoStore"
 import { FIXTURE_BODIES } from "../property/generators"
 
 /* -------------------------------------------------------------------------- */
@@ -82,9 +82,6 @@ import { FIXTURE_BODIES } from "../property/generators"
 
 /** The Coupon_Code every run below submits. */
 const COUPON_CODE = "SW2025NEWYEAR"
-
-/** Cause of the injected flush rejection, so the store warning can be matched. */
-const FLUSH_FAILURE_MESSAGE = "disk full"
 
 /** Cause of the injected `HistoryStore.append` rejection of case 3. */
 const APPEND_FAILURE_MESSAGE = "history append exploded"
@@ -167,8 +164,8 @@ const EARLY_STOP_COUNTS: OutcomeCounts = {
 /** One observed `HistoryStore.append` call. */
 interface AppendAttempt {
   readonly input: AppendHistoryInput
-  /** The `persisted` flag the append reported, or null when it rejected. */
-  readonly persisted: boolean | null
+  /** The `kind` the append reported, or null when it rejected. */
+  readonly kind: AppendHistoryResult["kind"] | null
 }
 
 /** How the wrapped {@link HistoryStore} behaves on `append`. */
@@ -178,22 +175,24 @@ interface HarnessOptions {
   readonly script: readonly StubScriptEntry[]
   /** Defaults to `"delegate"`, i.e. the real Redemption_History append. */
   readonly appendBehaviour?: AppendBehaviour
-  /** Whether the flush rejects once the roster is seeded. Defaults to true. */
-  readonly failFlushAfterSeeding?: boolean
+  /** Whether the deployment refuses the history insert. Defaults to true. */
+  readonly refuseHistoryInsert?: boolean
 }
 
 interface Harness {
   readonly registry: MemberRegistryStore
   /** The real Redemption_History, read to check what actually got stored. */
   readonly history: HistoryStore
+  /** The store behind both collections, for the stored documents. */
+  readonly handle: InMemoryMongoStoreHandle
   readonly upstream: StubUpstreamClient
   /** Every `append` the coordinator issued, in call order. */
   readonly appends: readonly AppendAttempt[]
-  /** Warnings the {@link createJsonStore} store logged. */
-  readonly storeWarnings: readonly string[]
   /** The fixed list of the run, read before it starts. */
   readonly fixedList: readonly MemberRegistryEntry[]
   readonly run: (couponCode: string) => Promise<readonly RunEvent[]>
+  /** The stored Redemption_History records, newest first. */
+  readonly storedRecords: () => Promise<readonly RedemptionHistoryRecord[]>
 }
 
 /**
@@ -216,11 +215,11 @@ function observableHistory(
       findLatestByCouponCode: inner.findLatestByCouponCode,
       append: async (input) => {
         if (behaviour === "reject") {
-          appends.push({ input, persisted: null })
+          appends.push({ input, kind: null })
           return Promise.reject(new Error(APPEND_FAILURE_MESSAGE))
         }
         const result = await inner.append(input)
-        appends.push({ input, persisted: result.persisted })
+        appends.push({ input, kind: result.kind })
         return result
       },
     },
@@ -229,41 +228,19 @@ function observableHistory(
 
 /**
  * A coordinator over a real Member_Registry and a real Redemption_History, both
- * backed by a store whose flush is injected, plus a stub upstream client
- * replaying `script`.
+ * over one in-memory Mongo_Store, plus a stub upstream client replaying
+ * `script`.
  *
  * The roster is seeded through the registry itself — the same `add` /
- * `listEnabled` path the application uses — while the flush still resolves. The
- * switch to a rejecting flush happens after the last seeding flush has settled,
- * which is why the store warnings observed later belong to the history append
- * alone.
+ * `listEnabled` path the application uses — and the injected refusal reaches
+ * only the `history` collection's `insertOne`, so seeding cannot fail for a
+ * reason the run is about to assert.
  */
 async function createHarness(options: HarnessOptions): Promise<Harness> {
-  const failFlushAfterSeeding = options.failFlushAfterSeeding ?? true
-  const storeWarnings: string[] = []
-  let flushRejects = false
-
-  const store = createJsonStore({
-    // A path inside a directory that is never created: the injected flush never
-    // touches the filesystem, and the repository data file is never referenced.
-    dataFilePath: join(
-      tmpdir(),
-      `scr-history-append-failure-${randomUUID()}`,
-      "store.json"
-    ),
-    flush: () =>
-      flushRejects
-        ? Promise.reject(new Error(FLUSH_FAILURE_MESSAGE))
-        : Promise.resolve(),
-    logger: {
-      warn: (message) => {
-        storeWarnings.push(message)
-      },
-    },
-  })
+  const handle = createInMemoryMongoStore()
 
   let nextId = 0
-  const registry = createMemberRegistryStore(store, {
+  const registry = createMemberRegistryStore(handle.store, {
     generateId: () => {
       nextId += 1
       return `m-${nextId}`
@@ -278,16 +255,11 @@ async function createHarness(options: HarnessOptions): Promise<Harness> {
         `could not seed roster entry ${JSON.stringify(member.hiveId)}: ${added.kind}`
       )
     }
-    // Seeding runs against the resolving flush, so nothing here contributes a
-    // persistence warning that a later assertion could mistake for its own.
-    if (!added.persisted) {
-      throw new Error(
-        `roster entry ${JSON.stringify(member.hiveId)} was not persisted while seeding`
-      )
-    }
   }
 
-  const realHistory = createHistoryStore(store)
+  const realHistory = createHistoryStore(handle.store, {
+    logger: handle.logger,
+  })
   const { history, appends } = observableHistory(
     realHistory,
     options.appendBehaviour ?? "delegate"
@@ -301,22 +273,43 @@ async function createHarness(options: HarnessOptions): Promise<Harness> {
     generateRunId: () => RUN_ID,
   })
 
-  const fixedList = registry.listEnabled()
-  flushRejects = failFlushAfterSeeding
+  const roster = await registry.listEnabled()
+  if (roster.kind !== "entries") {
+    throw new Error(`the roster read reported "${roster.kind}" while seeding`)
+  }
+
+  if (options.refuseHistoryInsert ?? true) {
+    handle.setRejection(
+      "history",
+      "insertOne",
+      new MongoServerError({
+        message: "Document failed validation",
+        code: 121,
+      })
+    )
+  }
 
   return {
     registry,
     history: realHistory,
+    handle,
     upstream,
     appends,
-    storeWarnings,
-    fixedList,
+    fixedList: roster.entries,
     run: async (couponCode) => {
       const events: RunEvent[] = []
       for await (const event of coordinator.start(couponCode)) {
         events.push(event)
       }
       return events
+    },
+    storedRecords: async () => {
+      handle.clearRejection("history", "insertOne")
+      const listed = await realHistory.list()
+      if (listed.kind !== "records") {
+        throw new Error(`the history read reported "${listed.kind}"`)
+      }
+      return listed.records
     },
   }
 }
@@ -394,15 +387,15 @@ function expectCompleteResultSet(
 
 /**
  * Asserts the Requirement 6.8 warning: exactly one, character-identical to
- * {@link HISTORY_NOT_PERSISTED_WARNING}, stating that the Redemption_History
- * record is not persisted.
+ * {@link HISTORY_NOT_PERSISTED_WARNING}.
+ *
+ * The constant is compared rather than its text. Task 12.1 rewords it to the
+ * `historyAppendFailedMessage()` sentence of Requirement 3.7, and this claim —
+ * one warning, that one — is what has to hold either way.
  */
 function expectSingleNotPersistedWarning(result: RedemptionRunResult): void {
   expect(result.warnings).toEqual([HISTORY_NOT_PERSISTED_WARNING])
   expect(result.warnings).toHaveLength(1)
-  expect(result.warnings[0]).toContain(
-    "The Redemption_History record is not persisted"
-  )
 }
 
 /* -------------------------------------------------------------------------- */
@@ -410,12 +403,9 @@ function expectSingleNotPersistedWarning(result: RedemptionRunResult): void {
 /* -------------------------------------------------------------------------- */
 
 describe("a failed Redemption_History append returns the outcomes with one warning (Requirement 6.8)", () => {
-  it("returns the complete result set and exactly one not-persisted warning when the flush rejects", async () => {
+  it("returns the complete result set and exactly one warning when the insert is refused", async () => {
     const harness = await createHarness({ script: FULL_RUN_SCRIPT })
     expect(harness.fixedList).toHaveLength(ROSTER.length)
-    // Seeding was silent, so every store warning counted below is the history
-    // append's own.
-    expect(harness.storeWarnings).toEqual([])
 
     const events = await harness.run(COUPON_CODE)
     const result = completedResult(events)
@@ -442,28 +432,26 @@ describe("a failed Redemption_History append returns the outcomes with one warni
       FULL_RUN_COUNTS
     )
 
-    // One warning, stating that the record is not persisted.
+    // One warning, stating that the record was not saved.
     expectSingleNotPersistedWarning(result)
 
     // The append was attempted exactly once and reported the failure it saw.
     expect(harness.appends).toHaveLength(1)
-    expect(harness.appends[0].persisted).toBe(false)
+    expect(harness.appends[0].kind).toBe("failed")
     expect(harness.appends[0].input.couponCode).toBe(COUPON_CODE)
 
-    // The store logged its own single write warning naming the cause; the
-    // durable copy is what was lost, not the result set.
-    expect(harness.storeWarnings).toHaveLength(1)
-    expect(harness.storeWarnings[0]).toContain(FLUSH_FAILURE_MESSAGE)
-
-    // The record is still in memory — a rejected flush is never rolled back —
-    // so the loss is durability alone.
-    expect(harness.history.list()).toHaveLength(1)
+    /* Requirement 3.7: nothing was written, not even partially, and the
+     * retention trim was never reached — so no record was deleted either and no
+     * retention warning was logged. */
+    expect(harness.handle.history()).toEqual([])
+    expect(harness.handle.callsTo("history")).not.toContain("deleteMany")
+    expect(harness.handle.warnings).toEqual([])
   })
 
-  it("returns zero warnings and one persisted record when the flush lands", async () => {
+  it("returns zero warnings and one stored record when the insert is served", async () => {
     const harness = await createHarness({
       script: FULL_RUN_SCRIPT,
-      failFlushAfterSeeding: false,
+      refuseHistoryInsert: false,
     })
 
     const result = completedResult(await harness.run(COUPON_CODE))
@@ -479,13 +467,13 @@ describe("a failed Redemption_History append returns the outcomes with one warni
 
     // The warning accompanies only the failing case: none here.
     expect(result.warnings).toEqual([])
-    expect(harness.storeWarnings).toEqual([])
+    expect(harness.handle.warnings).toEqual([])
 
-    // Exactly one Redemption_History record, appended once and persisted.
+    // Exactly one Redemption_History record, appended once and stored.
     expect(harness.appends).toHaveLength(1)
-    expect(harness.appends[0].persisted).toBe(true)
+    expect(harness.appends[0].kind).toBe("appended")
 
-    const records = harness.history.list()
+    const records = await harness.storedRecords()
     expect(records).toHaveLength(1)
     expect(records[0].runId).toBe(RUN_ID)
     expect(records[0].couponCode).toBe(COUPON_CODE)
@@ -499,8 +487,8 @@ describe("a failed Redemption_History append returns the outcomes with one warni
     const harness = await createHarness({
       script: FULL_RUN_SCRIPT,
       appendBehaviour: "reject",
-      // The flush is irrelevant here: `append` never reaches it.
-      failFlushAfterSeeding: false,
+      // The collection is irrelevant here: `append` never reaches it.
+      refuseHistoryInsert: false,
     })
 
     // Nothing escapes as an error: iterating the run resolves normally.
@@ -518,12 +506,13 @@ describe("a failed Redemption_History append returns the outcomes with one warni
 
     // Attempted once, and not retried after the rejection.
     expect(harness.appends).toHaveLength(1)
-    expect(harness.appends[0].persisted).toBeNull()
+    expect(harness.appends[0].kind).toBeNull()
 
     // The rejection happened before the real store was touched, so nothing was
-    // recorded and the store logged nothing.
-    expect(harness.history.list()).toEqual([])
-    expect(harness.storeWarnings).toEqual([])
+    // recorded and nothing was logged.
+    expect(harness.handle.callsTo("history")).toEqual([])
+    expect(await harness.storedRecords()).toEqual([])
+    expect(harness.handle.warnings).toEqual([])
   })
 
   it("returns the SKIPPED outcomes of an early-stopped run with the single warning", async () => {
@@ -552,8 +541,8 @@ describe("a failed Redemption_History append returns the outcomes with one warni
     expectSingleNotPersistedWarning(result)
 
     expect(harness.appends).toHaveLength(1)
-    expect(harness.appends[0].persisted).toBe(false)
+    expect(harness.appends[0].kind).toBe("failed")
     expect(harness.appends[0].input.stoppedEarly).toBe(true)
-    expect(harness.storeWarnings).toHaveLength(1)
+    expect(harness.handle.history()).toEqual([])
   })
 })

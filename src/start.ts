@@ -8,14 +8,33 @@
  * `import type { startInstance } from './start.ts'` and registers its options as
  * the app's Start config.
  *
- * Two middlewares run, in this order, for every request — server functions, SSR
- * documents, and static requests that reach the handler alike:
+ * Three middlewares run, in this order, for every request — server functions,
+ * SSR documents, and static requests that reach the handler alike:
  *
  * 1. {@link csrfMiddleware}, which refuses cross-site calls to server functions.
- * 2. {@link passphraseMiddleware}, the Access_Gate.
+ * 2. {@link clerkMiddleware}, which establishes the request's Clerk session and
+ *    consumes the Clerk cross-domain handshake.
+ * 3. {@link passphraseMiddleware}, the Access_Gate.
  *
  * CSRF first because it is the cheaper check and because a cross-site caller has
  * no business learning whether the gate is armed.
+ *
+ * Clerk in the middle, ahead of the gate, is load-bearing. The gate asks who the
+ * sender is — its decision reads the request's identity via `auth()`, which is
+ * only populated after `clerkMiddleware()` has run. And Clerk completes a
+ * cross-domain handshake by redirecting back with a `__clerk_handshake` query
+ * parameter and setting the session cookie on the way out; the gate returns a
+ * `Response` to reject, which short-circuits the chain. If the gate ran first it
+ * could reject a handshake request before Clerk had a chance to attach its
+ * `Set-Cookie`, discarding the cookie and looping the browser. Running Clerk
+ * before the gate is what keeps that handshake's `Set-Cookie` alive.
+ *
+ * This module wires Clerk into the chain and threads two facts into the gate:
+ * whether the request is a Clerk handshake (computed from the request URL's
+ * query parameters) and a lazy authorization resolver the gate invokes only when
+ * a request carries no valid Passphrase_Session. The gate combines the
+ * Passphrase_Session gate with the Account_Role gate; its own decision logic
+ * lives in {@link evaluateGate}.
  *
  * ## Why the CSRF middleware is written out here
  *
@@ -39,11 +58,14 @@
  * because a server function is reachable on its own URL.
  *
  * The decision itself is {@link evaluateGate} in `@/server/gate.server`, which
- * is a plain function over a pathname, a handler type, and a `Cookie:` header
- * string. This module is only the wiring: read the header, ask, and either
- * return the rejection response or call `next()`. The exemption list — the
- * login path and the static files needed to render it, never a server function —
- * is documented there.
+ * is a plain function over a pathname, a handler type, a `Cookie:` header
+ * string, a handshake fact, and an injected authorization resolver. This module
+ * is only the wiring: read the header, compute the handshake fact, pass the
+ * resolver, await the decision, and either return the rejection response or call
+ * `next()`. The exemption list — the login and sign-in paths and the static
+ * files needed to render them, never a server function — is documented there.
+ * `evaluateGate` is `async` because resolving the Account_Role awaits Mongo, so
+ * this middleware awaits it.
  *
  * The Shared_Passphrase is never read on this path and never appears in a
  * response or a log line (Requirement 8.10); neither this module nor the gate
@@ -55,9 +77,15 @@ import {
   createMiddleware,
   createStart,
 } from "@tanstack/react-start"
+import { clerkMiddleware } from "@clerk/tanstack-react-start/server"
 
 import { getAuth } from "@/server/auth.server"
-import { evaluateGate, gateRejectionResponse } from "@/server/gate.server"
+import { getAuthorization } from "@/server/authorization.server"
+import {
+  CLERK_HANDSHAKE_QUERY_PARAMS,
+  evaluateGate,
+  gateRejectionResponse,
+} from "@/server/gate.server"
 
 /**
  * Cross-site protection for server functions, registered explicitly because
@@ -76,12 +104,31 @@ const csrfMiddleware = createCsrfMiddleware({
  * directly, without booting a server.
  */
 const passphraseMiddleware = createMiddleware({ type: "request" }).server(
-  ({ next, request, pathname, handlerType }) => {
-    const decision = evaluateGate({
+  async ({ next, request, pathname, handlerType }) => {
+    /*
+     * Clerk completes its cross-domain handshake by redirecting back with a
+     * `__clerk_handshake` (or `__clerk_db_jwt`) query parameter and a
+     * `Set-Cookie`. The gate admits such a request (step 2) so clerkMiddleware()
+     * above can consume it; computing the fact here keeps the gate a pure
+     * function over plain facts, with no URL to parse.
+     */
+    const searchParams = new URL(request.url).searchParams
+    const clerkHandshake = CLERK_HANDSHAKE_QUERY_PARAMS.some((param) =>
+      searchParams.has(param)
+    )
+
+    const decision = await evaluateGate({
       auth: getAuth(),
       pathname,
       handlerType,
       cookieHeader: request.headers.get("cookie"),
+      clerkHandshake,
+      /*
+       * Lazy: the gate invokes this only at step 4, so a request with a valid
+       * Passphrase_Session (the common case) is admitted at step 3 without a
+       * Mongo read or a Clerk call (Requirement 7.1).
+       */
+      resolveAuthorization: () => getAuthorization().decide(),
     })
 
     if (decision.kind === "reject") {
@@ -99,5 +146,5 @@ const passphraseMiddleware = createMiddleware({ type: "request" }).server(
 
 /** The app's Start options. The name is fixed by the framework. */
 export const startInstance = createStart(() => ({
-  requestMiddleware: [csrfMiddleware, passphraseMiddleware],
+  requestMiddleware: [csrfMiddleware, clerkMiddleware(), passphraseMiddleware],
 }))

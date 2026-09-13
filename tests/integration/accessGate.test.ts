@@ -32,8 +32,8 @@
  * five-minute throttle block of Requirement 8.8 is exercised in microseconds.
  * The Shared_Passphrase and the signing key are injected too, and the one place
  * that reads an environment record calls {@link resolveConfig} with a literal, so
- * `process.env` is never touched. Every store is built on a path inside a
- * `mkdtemp` directory with a flush that resolves without writing, so
+ * `process.env` is never touched. Every store is the in-memory Mongo_Store of
+ * `tests/support/inMemoryMongoStore.ts`: no deployment and no file, so
  * `./data/store.json` is neither read nor written.
  *
  * ## Requirement 8.10, checked continuously
@@ -44,10 +44,6 @@
  * over the whole accumulated transcript, so a leak anywhere in any flow above
  * fails twice.
  */
-
-import { mkdtemp, rm } from "node:fs/promises"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest"
 
@@ -71,7 +67,6 @@ import {
   gateRejectionResponse,
 } from "@/server/gate.server"
 import { createHistoryStore } from "@/server/store/history.server"
-import { createJsonStore } from "@/server/store/jsonStore.server"
 import { createMemberRegistryStore } from "@/server/store/memberRegistry.server"
 import { Route as LoginRoute } from "@/routes/login"
 import { Route as LogoutRoute } from "@/routes/logout"
@@ -80,6 +75,8 @@ import type { Auth, ThrottleStatus } from "@/server/auth.server"
 import type { GateDecision } from "@/server/gate.server"
 import type { HistoryStore } from "@/server/store/history.server"
 import type { MemberRegistryStore } from "@/server/store/memberRegistry.server"
+
+import { createInMemoryMongoStore } from "../support/inMemoryMongoStore"
 
 /** The configured Shared_Passphrase. Must appear in nothing the gate emits. */
 const PASSPHRASE = "correct horse battery staple"
@@ -112,9 +109,6 @@ let nowMs = BASE_NOW
 
 /** Every response and every log line this file produced. Requirement 8.10. */
 const transcript: Array<string> = []
-
-/** Temporary directories to remove. */
-const tempDirs: Array<string> = []
 
 /** Moves the injected clock forward. Nothing in this file sleeps. */
 function advanceClock(byMs: number): void {
@@ -149,16 +143,9 @@ interface SeededStore {
  * on a path that does not exist and a flush that writes nothing.
  */
 async function seedStore(): Promise<SeededStore> {
-  const dir = await mkdtemp(join(tmpdir(), "scr-access-gate-"))
-  tempDirs.push(dir)
-
-  const store = createJsonStore({
-    dataFilePath: join(dir, "store.json"),
-    flush: () => Promise.resolve(),
-    logger: capturingLogger(),
-  })
-  const roster = createMemberRegistryStore(store)
-  const history = createHistoryStore(store)
+  const handle = createInMemoryMongoStore({ logger: capturingLogger() })
+  const roster = createMemberRegistryStore(handle.store)
+  const history = createHistoryStore(handle.store)
 
   const added = await roster.add({
     memberLabel: SEEDED_MEMBER_LABEL,
@@ -282,6 +269,7 @@ interface LoginView {
   readonly passphraseRequired: boolean
   readonly error: string | null
   readonly notice: string | null
+  readonly needs: "passphrase" | "passphrase-and-sign-in"
 }
 
 /** Renders the `/login` document context for `url`. */
@@ -349,16 +337,24 @@ interface GatedCall {
  * the gate, and reach the handler — which reads the roster and the history —
  * only when the decision admits.
  */
-function gatedCall(
+async function gatedCall(
   auth: Auth,
   seeded: SeededStore,
   cookieHeader: string | null
-): GatedCall {
-  const decision = evaluateGate({
+): Promise<GatedCall> {
+  const decision = await evaluateGate({
     auth,
     pathname: SERVER_FN_PATH,
     handlerType: "serverFn",
     cookieHeader,
+    clerkHandshake: false,
+    /*
+     * This suite exercises the Requirement 8 passphrase-only gate: no Clerk
+     * session is present, so authorization resolves to `anonymous` and a request
+     * without a valid Passphrase_Session is rejected, exactly as before the gate
+     * gained its second dimension.
+     */
+    resolveAuthorization: () => Promise.resolve({ kind: "anonymous" }),
   })
 
   if (decision.kind === "reject") {
@@ -369,9 +365,11 @@ function gatedCall(
     }
   }
 
+  const members = await seeded.roster.list()
+  const history = await seeded.history.list()
   const payload = JSON.stringify({
-    members: seeded.roster.list(),
-    history: seeded.history.list(),
+    members: members.kind === "entries" ? members.entries : [],
+    history: history.kind === "records" ? history.records : [],
   })
   return {
     decision,
@@ -387,11 +385,8 @@ beforeEach(() => {
   nowMs = BASE_NOW
 })
 
-afterEach(async () => {
+afterEach(() => {
   resetAuth()
-  for (const dir of tempDirs.splice(0)) {
-    await rm(dir, { recursive: true, force: true })
-  }
 })
 
 describe("a gated call carrying no Session (Requirements 8.2, 8.3, 8.10)", () => {
@@ -400,10 +395,16 @@ describe("a gated call carrying no Session (Requirements 8.2, 8.3, 8.10)", () =>
     const seeded = await seedStore()
 
     // The values searched for below really are in the store.
-    expect(seeded.roster.list()).toHaveLength(1)
-    expect(seeded.history.list()).toHaveLength(1)
+    const rosterListing = await seeded.roster.list()
+    const historyListing = await seeded.history.list()
+    expect(
+      rosterListing.kind === "entries" && rosterListing.entries
+    ).toHaveLength(1)
+    expect(
+      historyListing.kind === "records" && historyListing.records
+    ).toHaveLength(1)
 
-    const call = gatedCall(auth, seeded, null)
+    const call = await gatedCall(auth, seeded, null)
     const recorded = await transcribe(call.response)
 
     expect(call.reachedHandler).toBe(false)
@@ -430,7 +431,7 @@ describe("submit, use, end (Requirements 8.4, 8.7)", () => {
     const seeded = await seedStore()
 
     // Before: refused.
-    expect(gatedCall(auth, seeded, null).reachedHandler).toBe(false)
+    expect((await gatedCall(auth, seeded, null)).reachedHandler).toBe(false)
 
     const granted = await transcribe(await submitPassphrase(PASSPHRASE))
     expect(granted.status).toBe(303)
@@ -438,7 +439,7 @@ describe("submit, use, end (Requirements 8.4, 8.7)", () => {
     const cookieHeader = cookieFrom(granted.setCookie)
 
     // After: the very same call is admitted and reads the seeded store.
-    const admitted = gatedCall(auth, seeded, cookieHeader)
+    const admitted = await gatedCall(auth, seeded, cookieHeader)
     const served = await transcribe(admitted.response)
     expect(admitted.reachedHandler).toBe(true)
     expect(admitted.decision).toEqual({
@@ -459,7 +460,7 @@ describe("submit, use, end (Requirements 8.4, 8.7)", () => {
      * the browser's — the rejection reason is `revoked`, which only the
      * server-side registry removal can produce.
      */
-    const refused = gatedCall(auth, seeded, cookieHeader)
+    const refused = await gatedCall(auth, seeded, cookieHeader)
     const rejection = await transcribe(refused.response)
     expect(refused.reachedHandler).toBe(false)
     expect(refused.decision.kind).toBe("reject")
@@ -482,7 +483,7 @@ describe("a wrong value and the throttle (Requirements 8.5, 8.8)", () => {
     expect(rejected.status).toBe(303)
     expect(rejected.location).toBe(`${LOGIN_PATH}?error=incorrect`)
     expect(rejected.setCookie).toBeNull()
-    expect(gatedCall(auth, seeded, null).reachedHandler).toBe(false)
+    expect((await gatedCall(auth, seeded, null)).reachedHandler).toBe(false)
 
     // Requirement 8.8: the failure is counted against this sender.
     const status: ThrottleStatus = auth.throttleStatus(SENDER)
@@ -513,7 +514,7 @@ describe("a wrong value and the throttle (Requirements 8.5, 8.8)", () => {
     const blocked = await transcribe(await submitPassphrase(PASSPHRASE))
     expect(blocked.location).toBe(`${LOGIN_PATH}?error=throttled`)
     expect(blocked.setCookie).toBeNull()
-    expect(gatedCall(auth, seeded, null).reachedHandler).toBe(false)
+    expect((await gatedCall(auth, seeded, null)).reachedHandler).toBe(false)
     expect(
       (await loginView(`http://localhost:3000${LOGIN_PATH}?error=throttled`))
         .error
@@ -531,7 +532,9 @@ describe("a wrong value and the throttle (Requirements 8.5, 8.8)", () => {
     const granted = await transcribe(await submitPassphrase(PASSPHRASE))
     expect(granted.location).toBe("/")
     const cookieHeader = cookieFrom(granted.setCookie)
-    expect(gatedCall(auth, seeded, cookieHeader).reachedHandler).toBe(true)
+    expect((await gatedCall(auth, seeded, cookieHeader)).reachedHandler).toBe(
+      true
+    )
   })
 })
 
@@ -556,7 +559,8 @@ describe("the throttle counts per sender (Requirement 8.8)", () => {
     )
     expect(granted.location).toBe("/")
     expect(
-      gatedCall(auth, seeded, cookieFrom(granted.setCookie)).reachedHandler
+      (await gatedCall(auth, seeded, cookieFrom(granted.setCookie)))
+        .reachedHandler
     ).toBe(true)
 
     // The first sender is still blocked: one success does not clear another.
@@ -589,7 +593,7 @@ describe("no Shared_Passphrase configured (Requirements 8.1, 8.9)", () => {
     // Every request is admitted, with or without a cookie.
     const seeded = await seedStore()
     for (const cookieHeader of [null, `${SESSION_COOKIE_NAME}=junk`]) {
-      const call = gatedCall(auth, seeded, cookieHeader)
+      const call = await gatedCall(auth, seeded, cookieHeader)
       expect(call.decision).toEqual({ kind: "admit", reason: "gate-disabled" })
       expect(call.reachedHandler).toBe(true)
       expect((await transcribe(call.response)).body).toContain(SEEDED_HIVE_ID)
@@ -600,6 +604,7 @@ describe("no Shared_Passphrase configured (Requirements 8.1, 8.9)", () => {
       passphraseRequired: false,
       error: null,
       notice: GATE_DISABLED_MESSAGE,
+      needs: "passphrase-and-sign-in",
     })
   })
 })

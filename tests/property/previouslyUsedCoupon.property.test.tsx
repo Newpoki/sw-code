@@ -57,9 +57,6 @@
 // after every render rather than once per test — an `afterEach` hook fires once
 // per `it`, not once per fast-check run.
 
-import { tmpdir } from "node:os"
-import { join } from "node:path"
-
 import fc from "fast-check"
 import { describe, expect, it } from "vitest"
 import { cleanup, render } from "@testing-library/react"
@@ -71,14 +68,14 @@ import {
 } from "@/components/ConfirmRunDialog"
 import { readLatestRunForCoupon } from "@/functions/history.functions"
 import { createHistoryStore } from "@/server/store/history.server"
-import { createJsonStore } from "@/server/store/jsonStore.server"
-import type { JsonStore, StoreLogger } from "@/server/store/jsonStore.server"
 import type { HistoryStore } from "@/server/store/history.server"
+import type { MongoStore, StoreLogger } from "@/server/store/mongo.server"
 import type {
   MemberRegistryEntry,
   RedemptionHistoryRecord,
 } from "@/domain/types"
 
+import { createInMemoryMongoStore } from "../support/inMemoryMongoStore"
 import { rosterArb, trimmedCouponCodeArb } from "./generators"
 
 /** Fixed base instant, so every generated `completedAt` is deterministic. */
@@ -95,26 +92,34 @@ const MAX_APPENDS = 6
  */
 const ABSENT_COUPON_CODE = "NO SUCH COUPON CODE"
 
-/** No warning is expected: the injected flush resolves and no file is read. */
+/** No warning is expected: every store operation is served in memory. */
 const silentLogger: StoreLogger = { warn: () => undefined }
 
-let storeCounter = 0
-
 /**
- * A store whose flush resolves without touching the filesystem, over a
- * `DATA_FILE` path that is unique per store and never created — so the load
- * path starts from an empty document every time.
+ * A fresh in-memory Mongo_Store holding no Store_Document, so the read path
+ * starts from an empty collection every time.
  */
-function emptyStore(): JsonStore {
-  storeCounter += 1
-  return createJsonStore({
-    dataFilePath: join(
-      tmpdir(),
-      `scr-previously-used-${process.pid}-${storeCounter}.unused.json`
-    ),
-    flush: () => Promise.resolve(),
-    logger: silentLogger,
-  })
+function emptyStore(): MongoStore {
+  /* The in-memory Mongo_Store of `tests/support/inMemoryMongoStore.ts`: no
+   * deployment and no file, and every operation served, so a `failed` result
+   * anywhere below is a genuine falsification. */
+  return createInMemoryMongoStore({ logger: silentLogger }).store
+}
+
+/** The latest run for a Coupon_Code as a record or null, or a thrown reason. */
+async function latestRunFor(
+  history: HistoryStore,
+  couponCode: string
+): Promise<RedemptionHistoryRecord | null> {
+  const result = await history.findLatestByCouponCode(couponCode)
+  switch (result.kind) {
+    case "record":
+      return result.record
+    case "not-found":
+      return null
+    case "failed":
+      throw new Error(`the history read reported "${result.kind}"`)
+  }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -241,7 +246,7 @@ async function appendAll(
   }> = []
   for (const [index, seed] of seeds.entries()) {
     const couponCode = storedCodeFor(seed, target, index)
-    const { persisted, record } = await history.append({
+    const result = await history.append({
       runId: `run-${index}`,
       couponCode,
       completedAt: completedAtOf(seed),
@@ -249,9 +254,12 @@ async function appendAll(
       stoppedEarly: false,
       outcomes: [],
     })
-    // The injected flush resolves, so every append is durable.
-    expect(persisted).toBe(true)
-    appended.push({ record, matches: couponCode === target })
+    // Requirement 2.9: a `kind` of `appended` means the write is in the
+    // database, so a successful append carries no warning to check.
+    if (result.kind !== "appended") {
+      throw new Error(`could not seed the history: ${result.kind}`)
+    }
+    appended.push({ record: result.record, matches: couponCode === target })
   }
   return appended
 }
@@ -381,7 +389,7 @@ describe("Property 17: a previously used Coupon_Code is announced with its lates
 
           /* ---- The match ------------------------------------------------- */
 
-          const envelope = readLatestRunForCoupon(history, {
+          const envelope = await readLatestRunForCoupon(history, {
             couponCode: target,
           })
           expect(envelope.ok).toBe(true)
@@ -391,7 +399,7 @@ describe("Property 17: a previously used Coupon_Code is announced with its lates
           expect(envelope.warnings).toEqual([])
 
           /* The store seam agrees with the envelope operation over it. */
-          expect(history.findLatestByCouponCode(target)).toEqual(expected)
+          expect(await latestRunFor(history, target)).toEqual(expected)
 
           /* Whatever comes back holds the submitted code, character for
              character — never a near miss that merely resembles it. */
@@ -401,13 +409,13 @@ describe("Property 17: a previously used Coupon_Code is announced with its lates
 
           /* Surrounding whitespace is not trimmed away before comparing, so a
              padded submission matches only a record stored padded that way. */
-          expect(history.findLatestByCouponCode(` ${target} `)).toBe(null)
+          expect(await latestRunFor(history, ` ${target} `)).toBe(null)
 
           /* Letter case is compared, not folded: a shifted submission can only
              ever find a record stored in that shifted form. */
           const variant = caseVariantOf(target)
           if (variant !== null) {
-            const byVariant = history.findLatestByCouponCode(variant)
+            const byVariant = await latestRunFor(history, variant)
             expect(byVariant?.couponCode ?? variant).toBe(variant)
           }
 
@@ -417,15 +425,13 @@ describe("Property 17: a previously used Coupon_Code is announced with its lates
 
           /* And the other branch, on every sample: a Coupon_Code no record
              holds yields null, and null states no timestamp at all. */
-          const absent = readLatestRunForCoupon(history, {
+          const absent = await readLatestRunForCoupon(history, {
             couponCode: ABSENT_COUPON_CODE,
           })
           expect(absent.ok).toBe(true)
           if (!absent.ok) return
           expect(absent.data).toBe(null)
           expectAnnouncement(ABSENT_COUPON_CODE, roster, absent.data)
-
-          await store.whenIdle()
         }
       ),
       { numRuns: 100 }

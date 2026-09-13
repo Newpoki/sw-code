@@ -1,6 +1,6 @@
 /**
  * The Member_Registry server function surface (Requirements 1.1, 1.2, 1.3,
- * 1.4, 1.5, 1.8, 1.9, 1.11, 1.12).
+ * 1.4, 1.5, 1.9, 1.11, 2.8, 2.9, 2.14).
  *
  * Four `createServerFn` functions — `listMembers`, `addMember`,
  * `setMemberEnabled`, `removeMember` — each returning an
@@ -58,11 +58,19 @@
  *
  * ## Warnings
  *
- * A successful write whose flush landed carries zero warnings
- * (Requirement 1.12); a successful write whose flush failed carries exactly one
- * — {@link PERSISTENCE_WARNING} — stating the change is not persisted across a
- * restart (Requirement 1.8). A rejection carries no warning at all, because a
- * rejection writes nothing.
+ * There are none left on this surface. A store result of `added`, `updated`, or
+ * `removed` means the write is in the database (Requirement 2.9), so there is no
+ * applied-but-not-saved state to warn about, and a rejection writes nothing.
+ * Every envelope this module builds therefore carries zero warnings.
+ *
+ * ## A store failure is a rejection, not a success
+ *
+ * Each store result now carries a `failed` variant, and each is mapped through
+ * {@link storeFailureEnvelope}: `STORE_UNAVAILABLE` when no operation was served
+ * at all, `STORE_READ_FAILED` for the roster read (Requirement 2.14), and
+ * `STORE_WRITE_FAILED` for a change that was not saved (Requirement 2.8). The
+ * sentence is the store's own — it already names the attempted change — so this
+ * module composes nothing and never sees a driver error.
  */
 
 import { createServerFn } from "@tanstack/react-start"
@@ -78,6 +86,7 @@ import {
   memberNotFoundMessage,
   rosterFullMessage,
 } from "@/domain/rosterMessages"
+import { storeFailureEnvelope } from "@/domain/storeFailures"
 import { getMemberRegistryStore } from "@/server/store/memberRegistry.server"
 import type { z } from "zod"
 import type {
@@ -93,14 +102,6 @@ import type {
   SetEnabledResult,
 } from "@/server/store/memberRegistry.server"
 
-/**
- * The single persistence warning of Requirement 1.8: the change is applied and
- * served from memory, but it will not survive a restart. Exported so the roster
- * page and its tests assert the identical string instead of a paraphrase.
- */
-export const PERSISTENCE_WARNING =
-  "The change is applied but could not be written to storage, so it is not persisted across a restart."
-
 /** What `removeMember` returns on success: the id that is now gone. */
 export interface RemovedMember {
   readonly id: string
@@ -110,17 +111,12 @@ export interface RemovedMember {
 /* Envelope construction                                                      */
 /* -------------------------------------------------------------------------- */
 
-/** A successful envelope, with the persistence warning iff the flush failed. */
-function succeeded<T>(data: T, persisted: boolean): Envelope<T> {
-  return {
-    ok: true,
-    data,
-    warnings: persisted ? [] : [PERSISTENCE_WARNING],
-  }
-}
-
-/** A read envelope: nothing was written, so there is nothing to warn about. */
-function read<T>(data: T): Envelope<T> {
+/**
+ * A successful envelope. Always zero warnings: a store result that reports a
+ * write reports one that is in the database (Requirement 2.9), and a read writes
+ * nothing.
+ */
+function succeeded<T>(data: T): Envelope<T> {
   return { ok: true, data, warnings: [] }
 }
 
@@ -177,21 +173,23 @@ export const validateRemoveMemberInput = verdictValidator(
 /**
  * Maps an {@link AddMemberResult} onto its envelope.
  *
- * - `added` → the stored entry, with one persistence warning only when the
- *   flush failed (Requirements 1.1, 1.8, 1.12)
+ * - `added` → the stored entry, and zero warnings: the insert is in the database
+ *   (Requirements 1.1, 2.9)
  * - `duplicate` → `DUPLICATE_HIVE_ID`, the message naming the Member_Label of
  *   the conflicting entry (Requirement 1.2)
  * - `full` → `ROSTER_FULL`, the message stating the maximum of 100 entries
  *   (Requirement 1.11)
  * - `invalid` → `VALIDATION`, carrying the store's message, which names the
  *   field and its range (Requirement 1.3)
+ * - `failed` → a store rejection carrying the store's own sentence, which already
+ *   states that the change was not saved and names it (Requirement 2.8)
  */
 export function addResultEnvelope(
   result: AddMemberResult
 ): Envelope<MemberRegistryEntry> {
   switch (result.kind) {
     case "added":
-      return succeeded(result.entry, result.persisted)
+      return succeeded(result.entry)
     case "duplicate":
       return rejected(
         "DUPLICATE_HIVE_ID",
@@ -201,40 +199,65 @@ export function addResultEnvelope(
       return rejected("ROSTER_FULL", rosterFullMessage())
     case "invalid":
       return rejected("VALIDATION", result.message)
+    case "failed":
+      return storeFailureEnvelope(result.failure, "write")
   }
 }
 
-/** Maps a {@link SetEnabledResult} onto its envelope (Requirement 1.9). */
+/** Maps a {@link SetEnabledResult} onto its envelope (Requirements 1.9, 2.8). */
 export function setEnabledResultEnvelope(
   result: SetEnabledResult
 ): Envelope<MemberRegistryEntry> {
-  return result.kind === "updated"
-    ? succeeded(result.entry, result.persisted)
-    : rejected("MEMBER_NOT_FOUND", memberNotFoundMessage())
+  switch (result.kind) {
+    case "updated":
+      return succeeded(result.entry)
+    case "not-found":
+      return rejected("MEMBER_NOT_FOUND", memberNotFoundMessage())
+    case "failed":
+      return storeFailureEnvelope(result.failure, "write")
+  }
 }
 
-/** Maps a {@link RemoveMemberResult} onto its envelope (Requirement 1.5). */
+/** Maps a {@link RemoveMemberResult} onto its envelope (Requirements 1.5, 2.8). */
 export function removeResultEnvelope(
   id: string,
   result: RemoveMemberResult
 ): Envelope<RemovedMember> {
-  return result.kind === "removed"
-    ? succeeded({ id }, result.persisted)
-    : rejected("MEMBER_NOT_FOUND", memberNotFoundMessage())
+  switch (result.kind) {
+    case "removed":
+      return succeeded({ id })
+    case "not-found":
+      return rejected("MEMBER_NOT_FOUND", memberNotFoundMessage())
+    case "failed":
+      return storeFailureEnvelope(result.failure, "write")
+  }
 }
 
 /* -------------------------------------------------------------------------- */
 /* Envelope operations over a store                                           */
 /* -------------------------------------------------------------------------- */
 
-/** The roster in insertion order (Requirement 1.4). Reads nothing else. */
-export function readRoster(
+/**
+ * The roster in position order (Requirements 1.4, 2.2). Reads nothing else.
+ *
+ * A read is a round trip to a deployment that may not answer, so it can fail: a
+ * `failed` result becomes a rejection carrying the store's own sentence and no
+ * entries at all, which is what keeps "the database is unreachable" from
+ * rendering as "the roster is empty" (Requirement 2.14).
+ *
+ * The entries are copied out of the read-only result so the envelope carries a
+ * mutable array, matching what every caller already holds.
+ */
+export async function readRoster(
   store: MemberRegistryStore
-): Envelope<MemberRegistryEntry[]> {
-  return read(store.list())
+): Promise<Envelope<MemberRegistryEntry[]>> {
+  const result = await store.list()
+  return result.kind === "entries"
+    ? succeeded([...result.entries])
+    : storeFailureEnvelope(result.failure, "read")
 }
 
-/** Requirements 1.1, 1.2, 1.3, 1.8, 1.11, 1.12. */
+/** Requirements 1.1, 1.2, 1.3, 1.11, 2.8, 2.9. */
 export async function addToRoster(
   store: MemberRegistryStore,
   input: AddMemberInput
@@ -271,11 +294,11 @@ export async function removeFromRoster(
  * Access_Gate and the cross-site check are applied globally in `src/start.ts`,
  * so nothing here re-checks them.
  */
-export const listMembers = createServerFn().handler(() =>
+export const listMembers = createServerFn().handler(async () =>
   readRoster(getMemberRegistryStore())
 )
 
-/** Stores a new roster entry (Requirements 1.1, 1.2, 1.3, 1.8, 1.11, 1.12). */
+/** Stores a new roster entry (Requirements 1.1, 1.2, 1.3, 1.11, 2.8, 2.9). */
 export const addMember = createServerFn({ method: "POST" })
   .validator(validateAddMemberInput)
   .handler(async ({ data }) =>

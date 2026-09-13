@@ -15,16 +15,12 @@
 // ones. `predictAddResult` below is that rule, and the classification test
 // asserts the store agrees with it for arbitrary pairs.
 //
-// Two observations back "the Member_Registry is unchanged": `list()` is
+// Two observations back "the Member_Registry is unchanged": the roster read is
 // snapshotted before and after every submission and deep-compared, and the
-// flush counter of the injected store must not move, so a rejection neither
-// alters the in-memory roster nor enqueues a write. The store is built over a
-// temporary `DATA_FILE` with the flush replaced, so `./data/store.json` is
-// never touched.
-
-import { randomUUID } from "node:crypto"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
+// number of `insertOne` calls the store served must not move, so a rejection
+// neither stores anything nor attempts to. The store is the in-memory
+// Mongo_Store of `tests/support/inMemoryMongoStore.ts`, so no deployment and no
+// file is touched, and every read is awaited.
 
 import fc from "fast-check"
 import { describe, expect, it } from "vitest"
@@ -35,7 +31,6 @@ import {
   MEMBER_LABEL_MAX_LENGTH,
   lengthRangeMessage,
 } from "@/domain/schemas"
-import { createJsonStore } from "@/server/store/jsonStore.server"
 import {
   MEMBER_REGISTRY_MAX_ENTRIES,
   createMemberRegistryStore,
@@ -48,6 +43,7 @@ import type {
 } from "@/server/store/memberRegistry.server"
 import type { MemberRegistryEntry } from "@/domain/types"
 
+import { createInMemoryMongoStore } from "../support/inMemoryMongoStore"
 import {
   anyHiveIdArb,
   anyMemberLabelArb,
@@ -130,29 +126,37 @@ const FIELD_BOUNDS: Readonly<Record<MemberField, number>> = {
 
 interface Harness {
   readonly registry: MemberRegistryStore
-  /** Number of flushes enqueued so far. Zero for every rejected submission. */
-  readonly flushes: () => number
+  /**
+   * Number of inserts the `members` collection served so far. It does not move
+   * for a rejected submission, which is the "nothing was written" half — and a
+   * stronger reading of it than a count of durable writes was, because a
+   * rejection does not even reach the collection.
+   */
+  readonly inserts: () => number
+  /** The stored roster in position order. */
+  readonly entries: () => Promise<readonly MemberRegistryEntry[]>
 }
 
 /**
- * A Member_Registry over a store that reads no existing file and writes none:
- * the `DATA_FILE` path is a temporary name that is never created, and `flush`
- * is replaced by a counter, so the real `./data/store.json` stays untouched.
+ * A Member_Registry over an in-memory Mongo_Store: no deployment, no file, and
+ * every operation served, so a rejection below is the store's own verdict.
  */
 function createHarness(): Harness {
-  let flushes = 0
-  const store = createJsonStore({
-    dataFilePath: join(tmpdir(), `roster-validation-${randomUUID()}.json`),
-    flush: () => {
-      flushes += 1
-      return Promise.resolve()
-    },
-    logger: { warn: () => undefined },
-  })
+  const handle = createInMemoryMongoStore()
+  const registry = createMemberRegistryStore(handle.store)
 
   return {
-    registry: createMemberRegistryStore(store),
-    flushes: () => flushes,
+    registry,
+    inserts: () =>
+      handle.callsTo("members").filter((method) => method === "insertOne")
+        .length,
+    entries: async () => {
+      const listed = await registry.list()
+      if (listed.kind !== "entries") {
+        throw new Error(`the roster read reported "${listed.kind}"`)
+      }
+      return listed.entries
+    },
   }
 }
 
@@ -292,8 +296,8 @@ describe("Property 13: roster validation rejects invalid submissions without mut
           const harness = createHarness()
           await seed(harness.registry, entries)
 
-          const before = harness.registry.list()
-          const flushesBefore = harness.flushes()
+          const before = await harness.entries()
+          const insertsBefore = harness.inserts()
           const result = await harness.registry.add(submission)
 
           // Requirement 1.3: rejected, naming the field and its allowed range.
@@ -311,9 +315,10 @@ describe("Property 13: roster validation rejects invalid submissions without mut
             String(FIELD_BOUNDS[submission.expectedField])
           )
 
-          // ... the Member_Registry is unchanged, and nothing was written.
-          expect(harness.registry.list()).toEqual(before)
-          expect(harness.flushes()).toBe(flushesBefore)
+          // ... the Member_Registry is unchanged, and nothing was inserted.
+          expect(await harness.entries()).toEqual(before)
+          expect(harness.inserts()).toBe(insertsBefore)
+          // Requirement 2.9: no result carries a persistence flag any more.
           expect("persisted" in result).toBe(false)
         }
       ),
@@ -336,8 +341,8 @@ describe("Property 13: roster validation rejects invalid submissions without mut
           expect(submitted).not.toBe(target.hiveId)
           expect(submitted.trim()).toBe(target.hiveId)
 
-          const before = harness.registry.list()
-          const flushesBefore = harness.flushes()
+          const before = await harness.entries()
+          const insertsBefore = harness.inserts()
           const result = await harness.registry.add({
             memberLabel,
             hiveId: submitted,
@@ -351,9 +356,9 @@ describe("Property 13: roster validation rejects invalid submissions without mut
             target.memberLabel
           )
 
-          // ... the Member_Registry is unchanged, and nothing was written.
-          expect(harness.registry.list()).toEqual(before)
-          expect(harness.flushes()).toBe(flushesBefore)
+          // ... the Member_Registry is unchanged, and nothing was inserted.
+          expect(await harness.entries()).toEqual(before)
+          expect(harness.inserts()).toBe(insertsBefore)
           expect("persisted" in result).toBe(false)
         }
       ),
@@ -389,10 +394,9 @@ describe("Property 13: roster validation rejects invalid submissions without mut
           expect(result.kind).toBe("added")
           if (result.kind !== "added") return
           expect(result.entry.hiveId).toBe(swapped)
-          expect(harness.registry.list().map((entry) => entry.hiveId)).toEqual([
-            hiveId,
-            swapped,
-          ])
+          expect(
+            (await harness.entries()).map((entry) => entry.hiveId)
+          ).toEqual([hiveId, swapped])
         }
       ),
       { numRuns: 100 }
@@ -407,8 +411,8 @@ describe("Property 13: roster validation rejects invalid submissions without mut
           const harness = createHarness()
           await seed(harness.registry, entries)
 
-          const before = harness.registry.list()
-          const flushesBefore = harness.flushes()
+          const before = await harness.entries()
+          const insertsBefore = harness.inserts()
           const expected = predictAddResult(before, { memberLabel, hiveId })
           const result = await harness.registry.add({ memberLabel, hiveId })
 
@@ -418,14 +422,14 @@ describe("Property 13: roster validation rejects invalid submissions without mut
             if (result.kind !== "added") return
             expect(result.entry.memberLabel).toBe(expected.memberLabel)
             expect(result.entry.hiveId).toBe(expected.hiveId)
-            expect(harness.registry.list()).toEqual([...before, result.entry])
-            expect(harness.flushes()).toBe(flushesBefore + 1)
+            expect(await harness.entries()).toEqual([...before, result.entry])
+            expect(harness.inserts()).toBe(insertsBefore + 1)
             return
           }
 
-          // Every rejection leaves the roster alone and enqueues no write.
-          expect(harness.registry.list()).toEqual(before)
-          expect(harness.flushes()).toBe(flushesBefore)
+          // Every rejection leaves the roster alone and inserts nothing.
+          expect(await harness.entries()).toEqual(before)
+          expect(harness.inserts()).toBe(insertsBefore)
           expect("persisted" in result).toBe(false)
 
           if (expected.kind === "invalid") {

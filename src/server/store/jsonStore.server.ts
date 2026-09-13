@@ -1,38 +1,56 @@
 /**
- * JsonStore: the one persistent document behind the Member_Registry and the
- * Redemption_History (Requirements 1.7, 1.8, 6.5).
+ * JsonStore: retired as a live store by the mongodb-google-auth-admin feature.
  *
- * The whole dataset — at most 100 roster entries plus the retained history
- * records — is held in memory as a single versioned document. A mutation runs
- * synchronously against that in-memory document, so it is visible to the very
- * next read, and the durable write is enqueued behind it on one promise chain.
- * The caller learns whether the write landed through `persisted`.
+ * This module is no longer wired to any request path. The Mongo_Store
+ * (`mongo.server.ts`) is the only store the Redemption_Server serves reads and
+ * writes from; `memberRegistry.server.ts` and `history.server.ts` were rewritten
+ * over `getMongoStore()` and no longer touch this file. Nothing under `src/`
+ * imports it any more.
  *
- * ## A rejected flush never rolls back
+ * ## What survives, and why
  *
- * Requirement 1.8 requires a failed store write to leave the change visible in
- * memory and to surface a warning instead. That is exactly what happens here:
- * `mutate` applies the mutator first and reports `persisted: false` second. The
- * in-memory document is never reverted, and a rejected flush does not break the
- * chain, so a later mutation can still be written.
+ * {@link parseStoreDocument} (with {@link StoreDocument}, {@link STORE_VERSION},
+ * and {@link ParseStoreDocumentResult}) is the definition of "the expected
+ * shape" that Requirement 4.1 refers to, and it is the reader the Data_Import
+ * (task 13) reuses to read the Legacy_Json_Store. It stays exported and tested
+ * for exactly that reason.
  *
- * ## Atomic flush
+ * ## What is now dead code
  *
- * A flush writes `<DATA_FILE>.tmp` with mode `0600`, `fsync`s it, and renames it
- * over `DATA_FILE`. A reader therefore sees either the previous document or the
- * new one, never a half-written file. The parent directory is created on demand.
+ * The whole write side — `JsonStore`, its `mutate` / `enqueueFlush` /
+ * `atomicFlush` flush path, and the `getJsonStore` / `setJsonStore` /
+ * `resetJsonStore` / `createJsonStore` singleton machinery — is retained only so
+ * this module still compiles and so `parseStoreDocument`'s neighbours (the
+ * corrupt-file reader that `storeEdgeCases.test.ts` exercises directly) keep
+ * working. It is wired to nothing. It is not deleted because the
+ * shared-coupon-redemption tests still construct `JsonStore` and drive its flush
+ * path directly; deleting it would break them for no benefit.
  *
- * ## Corrupt file handling
+ * The doc comments below describe the historical shared-coupon-redemption
+ * behaviour of this code. None of it runs on a request path any more.
+ *
+ * ### Historical: a rejected flush never rolled back
+ *
+ * Under shared-coupon-redemption Requirement 1.8 a failed store write left the
+ * change visible in memory and surfaced a warning: `mutate` applied the mutator
+ * first and reported `persisted: false` second, never reverting the in-memory
+ * document. The mongodb-google-auth-admin Requirement 2.8 supersedes this — a
+ * failed write is now a rejection, not a success with a warning — but the code
+ * is left intact for the tests that still exercise it.
+ *
+ * ### Historical: atomic flush
+ *
+ * A flush wrote `<DATA_FILE>.tmp` with mode `0600`, `fsync`ed it, and renamed it
+ * over `DATA_FILE`, so a reader saw either the previous document or the new one,
+ * never a half-written file. This path is now dead code.
+ *
+ * ### Corrupt file handling (still exercised by the reader)
  *
  * An absent `DATA_FILE` starts an empty store. A `DATA_FILE` that cannot be
  * parsed — or that parses but does not hold the expected shape — is renamed to
  * `<base>.corrupt-<timestamp>.json` beside it, the store starts empty, and a
- * warning naming the reason is logged. A bad file degrades the app to an empty
- * roster instead of preventing startup.
- *
- * This module owns load, mutate, and flush only. The Member_Registry semantics
- * (`memberRegistry.server.ts`) and the Redemption_History semantics
- * (`history.server.ts`) are built on top of `read()` and `mutate()`.
+ * warning naming the reason is logged. This reader path shares
+ * {@link parseStoreDocument} with the Data_Import.
  */
 
 import { basename, dirname, extname, join } from "node:path"
@@ -91,6 +109,8 @@ export interface FlushRequest {
  * A durable write. Resolving means the document is on disk; rejecting means it
  * is not, and the caller of the mutation is told `persisted: false`.
  * Overridable so tests can force a rejection without touching the filesystem.
+ *
+ * Dead code: no live path enqueues a flush any more (see the module header).
  */
 export type FlushFn = (request: FlushRequest) => Promise<void>
 
@@ -99,10 +119,15 @@ export interface StoreLogger {
   warn: (message: string) => void
 }
 
-/** Outcome of one mutation: the mutator's return value plus durability. */
+/**
+ * Outcome of one mutation: the mutator's return value plus durability.
+ *
+ * Dead code: the live stores return their own result shapes over the Mongo_Store
+ * and no longer carry a `persisted` flag (Requirement 2.8).
+ */
 export interface MutationResult<T> {
   readonly value: T
-  /** False when the flush for this mutation rejected (Requirement 1.8). */
+  /** False when the flush for this mutation rejected (historical Req. 1.8). */
   readonly persisted: boolean
 }
 
@@ -278,6 +303,9 @@ function errorMessage(error: unknown): string {
  * temporary file with mode `0600`, `fsync` it, then rename it over the target.
  * The temporary file is removed on failure so a partial write is never left
  * behind next to the real document.
+ *
+ * Dead code: no live path calls this any more (see the module header). It is
+ * retained as the default flush for the tests that still drive `JsonStore`.
  */
 export const atomicFlush: FlushFn = async ({ filePath, contents }) => {
   const tmpPath = `${filePath}.tmp`
@@ -304,6 +332,12 @@ export const atomicFlush: FlushFn = async ({ filePath, contents }) => {
  * The JSON-document store. Construct one per `DATA_FILE`; the load happens in
  * the constructor, synchronously, because it runs once at startup and every
  * later read is expected to be synchronous.
+ *
+ * Dead code as a live store: nothing under `src/` constructs this any more. The
+ * class and its write side survive only for the shared-coupon-redemption tests
+ * that still exercise them, and for the corrupt-file reader path that shares
+ * {@link parseStoreDocument} with the Data_Import. The whole `mutate` /
+ * `enqueueFlush` write side below is wired to no request path.
  */
 export class JsonStore {
   readonly filePath: string
@@ -333,6 +367,8 @@ export class JsonStore {
    * enqueues a flush and resolves with `persisted` once that flush settles.
    *
    * A throwing mutator propagates synchronously and enqueues nothing.
+   *
+   * Dead code: the live stores mutate MongoDB, not this document.
    */
   mutate<T>(
     mutator: (document: StoreDocument) => T
@@ -350,6 +386,8 @@ export class JsonStore {
    * Enqueues one flush behind every earlier one. The document is serialized
    * here, synchronously, so the text a flush writes is the state as of its own
    * mutation. A rejection is swallowed into `false` so the chain survives it.
+   *
+   * Dead code: reached only through {@link mutate}, which no live path calls.
    */
   private enqueueFlush(): Promise<boolean> {
     const request: FlushRequest = {
@@ -426,7 +464,10 @@ export class JsonStore {
   }
 }
 
-/** Creates a store for an arbitrary `DATA_FILE`. Used by tests and by wiring. */
+/**
+ * Creates a store for an arbitrary `DATA_FILE`. Used by tests only now; no
+ * application wiring constructs a `JsonStore` any more.
+ */
 export function createJsonStore(options: JsonStoreOptions = {}): JsonStore {
   return new JsonStore(options)
 }
@@ -436,11 +477,9 @@ let defaultStore: JsonStore | null = null
 /**
  * The process-wide store, created on first use.
  *
- * The path is read straight from `process.env.DATA_FILE` rather than from
- * `config.server.ts`, so this module stays importable by the store tests
- * without pulling configuration in. Application wiring calls
- * {@link setJsonStore} with a store built from the resolved configuration
- * before anything else touches it.
+ * Dead code: no live path calls this. It once was the store application wiring
+ * installed over {@link setJsonStore}; the Mongo_Store now fills that role and
+ * nothing invokes this accessor on a request path. Retained for the tests only.
  */
 export function getJsonStore(): JsonStore {
   defaultStore ??= createJsonStore({

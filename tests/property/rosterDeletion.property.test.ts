@@ -33,26 +33,28 @@
 // roster are all covered, and the history invariant is re-checked after each
 // step.
 //
-// No file is written: the store is built over an unused temporary path with the
-// filesystem flush replaced by a resolving stub, so `persisted` is true on every
-// mutation and the warning sink stays empty.
-
-import { randomUUID } from "node:crypto"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
+// No deployment and no file is touched: both stores run over the in-memory
+// Mongo_Store of `tests/support/inMemoryMongoStore.ts`, every operation is
+// awaited, and every one of them is served — so a `failed` result anywhere below
+// falsifies the property rather than being an arranged case. Nothing reports
+// `persisted` any more: a `kind` of `added`, `updated`, `removed`, or `appended`
+// means the write is in the database (Requirements 2.9, 3.12 of
+// mongodb-google-auth-admin), and the warning sink still has to stay empty.
 
 import fc from "fast-check"
 import { describe, expect, it } from "vitest"
 
 import { MEMBER_OUTCOME_VALUES } from "@/domain/types"
-import { createJsonStore } from "@/server/store/jsonStore.server"
 import { createMemberRegistryStore } from "@/server/store/memberRegistry.server"
 import {
   createHistoryStore,
   toHistoryOutcomeRows,
 } from "@/server/store/history.server"
 import type { HistoryStore } from "@/server/store/history.server"
-import type { MemberRegistryStore } from "@/server/store/memberRegistry.server"
+import type {
+  ListMembersResult,
+  MemberRegistryStore,
+} from "@/server/store/memberRegistry.server"
 import type {
   MemberOutcome,
   MemberOutcomeValue,
@@ -60,6 +62,7 @@ import type {
   RedemptionHistoryRecord,
 } from "@/domain/types"
 
+import { createInMemoryMongoStore } from "../support/inMemoryMongoStore"
 import { enabledEntries, rosterArb, trimmedCouponCodeArb } from "./generators"
 
 /** Roster size ceiling. Small on purpose: every entry is removed per sample. */
@@ -197,30 +200,25 @@ interface Harness {
   readonly registry: MemberRegistryStore
   readonly history: HistoryStore
   /** Everything the store logged; expected to stay empty. */
-  readonly warnings: Array<string>
+  readonly warnings: readonly string[]
+  /** The roster in position order. */
+  readonly roster: () => Promise<readonly MemberRegistryEntry[]>
+  /** The enabled entries in position order — the fixed list of a later run. */
+  readonly enabled: () => Promise<readonly MemberRegistryEntry[]>
+  /** The retained Redemption_History records in read order. */
+  readonly records: () => Promise<readonly RedemptionHistoryRecord[]>
 }
 
 /**
- * A Member_Registry and a Redemption_History over one store that touches no
- * filesystem: the flush resolves immediately and the data file path points at a
- * directory that is never created.
+ * A Member_Registry and a Redemption_History over one in-memory Mongo_Store:
+ * two collections of one store, exactly as the application has them.
  */
 function createHarness(): Harness {
-  const warnings: Array<string> = []
+  const handle = createInMemoryMongoStore()
   let nextId = 0
   let clock = BASE_TIME
 
-  const store = createJsonStore({
-    dataFilePath: join(tmpdir(), `scr-deletion-${randomUUID()}`, "store.json"),
-    flush: () => Promise.resolve(),
-    logger: {
-      warn: (message) => {
-        warnings.push(message)
-      },
-    },
-  })
-
-  const registry = createMemberRegistryStore(store, {
+  const registry = createMemberRegistryStore(handle.store, {
     generateId: () => {
       nextId += 1
       return `m-${nextId}`
@@ -230,8 +228,32 @@ function createHarness(): Harness {
       return new Date(clock)
     },
   })
+  const history = createHistoryStore(handle.store, { logger: handle.logger })
 
-  return { registry, history: createHistoryStore(store), warnings }
+  const rosterRead = async (
+    read: () => Promise<ListMembersResult>
+  ): Promise<readonly MemberRegistryEntry[]> => {
+    const listed = await read()
+    if (listed.kind !== "entries") {
+      throw new Error(`the roster read reported "${listed.kind}"`)
+    }
+    return listed.entries
+  }
+
+  return {
+    registry,
+    history,
+    warnings: handle.warnings,
+    roster: () => rosterRead(registry.list),
+    enabled: () => rosterRead(registry.listEnabled),
+    records: async () => {
+      const listed = await history.list()
+      if (listed.kind !== "records") {
+        throw new Error(`the history read reported "${listed.kind}"`)
+      }
+      return listed.records
+    },
+  }
 }
 
 /**
@@ -254,7 +276,6 @@ async function seedRoster(
     if (added.kind !== "added") {
       throw new Error(`could not seed ${entry.hiveId}: ${added.kind}`)
     }
-    expect(added.persisted).toBe(true)
 
     if (entry.enabled) {
       stored.push(added.entry)
@@ -321,19 +342,21 @@ async function seedHistory(
       stoppedEarly: seed.stoppedEarly,
       outcomes: toHistoryOutcomeRows(outcomesOf(stored, seed)),
     })
-    expect(appended.persisted).toBe(true)
+    expect(appended.kind).toBe("appended")
   }
 }
 
 /**
  * A detached copy of the whole Redemption_History in its read order.
  *
- * The clone is the point: `list()` returns the stored record objects, so
- * comparing the history against a snapshot of references could not detect an
- * in-place edit of a record or of one of its outcome rows.
+ * The clone stays, even though a read now maps fresh objects out of the stored
+ * documents: what the snapshot has to be independent of is the store, and a
+ * clone says so without relying on a mapping detail to hold.
  */
-function snapshotHistory(harness: Harness): Array<RedemptionHistoryRecord> {
-  return structuredClone(harness.history.list())
+async function snapshotHistory(
+  harness: Harness
+): Promise<Array<RedemptionHistoryRecord>> {
+  return structuredClone([...(await harness.records())])
 }
 
 /** How many stored outcome rows reference `hiveId`. */
@@ -353,12 +376,12 @@ function rowsFor(
  * unchanged, and every Coupon_Code still resolves through
  * `findLatestByCouponCode`.
  */
-function assertHistoryPreserved(
+async function assertHistoryPreserved(
   harness: Harness,
   expected: readonly RedemptionHistoryRecord[],
   removedHiveId: string
-): void {
-  const after = harness.history.list()
+): Promise<void> {
+  const after = await harness.records()
 
   expect(after).toEqual(expected)
   expect(after).toHaveLength(expected.length)
@@ -380,7 +403,11 @@ function assertHistoryPreserved(
 
   // Requirement 6.7 still answers for every retained Coupon_Code.
   for (const record of expected) {
-    expect(harness.history.findLatestByCouponCode(record.couponCode)).toEqual(
+    const found = await harness.history.findLatestByCouponCode(
+      record.couponCode
+    )
+    expect(found.kind).toBe("record")
+    expect(found.kind === "record" ? found.record : null).toEqual(
       expected.find((candidate) => candidate.couponCode === record.couponCode)
     )
   }
@@ -422,57 +449,55 @@ describe("Property 15: roster deletion preserves history, disabled entries are e
           /* Requirement 1.6: a disabled entry is not in the fixed list       */
           /* ---------------------------------------------------------------- */
 
-          expect(harness.registry.list()).toEqual(model)
-          expect(harness.registry.listEnabled()).toEqual(enabledEntries(model))
-          expect(harness.registry.listEnabled()).toHaveLength(
+          expect(await harness.roster()).toEqual(model)
+          expect(await harness.enabled()).toEqual(enabledEntries(model))
+          expect(await harness.enabled()).toHaveLength(
             model.filter((entry) => entry.enabled).length
           )
 
           if (model.length > 0) {
             const index = disablePick % model.length
             const target = model[index]
-            const listBefore = harness.registry.list()
-            const enabledBefore = harness.registry.listEnabled()
+            const listBefore = await harness.roster()
+            const enabledBefore = await harness.enabled()
 
             const updated = await harness.registry.setEnabled(target.id, false)
             if (updated.kind !== "updated") {
               throw new Error(`could not disable ${target.id}`)
             }
-            expect(updated.persisted).toBe(true)
             model[index] = updated.entry
 
             // Only `enabled` changed, and only for the toggled entry.
-            expect(harness.registry.list()).toEqual(
+            expect(await harness.roster()).toEqual(
               listBefore.map((entry) =>
                 entry.id === target.id ? { ...entry, enabled: false } : entry
               )
             )
             // Exactly that entry left the fixed list; the rest kept their order.
-            expect(harness.registry.listEnabled()).toEqual(
+            const enabledAfter = await harness.enabled()
+            expect(enabledAfter).toEqual(
               enabledBefore.filter((entry) => entry.id !== target.id)
             )
             // The reported enabled count drops by one when it was enabled.
-            expect(harness.registry.listEnabled()).toHaveLength(
+            expect(enabledAfter).toHaveLength(
               enabledBefore.length - (target.enabled ? 1 : 0)
             )
-            expect(
-              harness.registry
-                .listEnabled()
-                .some((entry) => entry.id === target.id)
-            ).toBe(false)
+            expect(enabledAfter.some((entry) => entry.id === target.id)).toBe(
+              false
+            )
           }
 
           /* ---------------------------------------------------------------- */
           /* An unknown id changes nothing                                   */
           /* ---------------------------------------------------------------- */
 
-          const rosterBeforeUnknown = harness.registry.list()
-          const historyBeforeUnknown = snapshotHistory(harness)
+          const rosterBeforeUnknown = await harness.roster()
+          const historyBeforeUnknown = await snapshotHistory(harness)
           expect(await harness.registry.remove("unknown-before")).toEqual({
             kind: "not-found",
           })
-          expect(harness.registry.list()).toEqual(rosterBeforeUnknown)
-          expect(harness.history.list()).toEqual(historyBeforeUnknown)
+          expect(await harness.roster()).toEqual(rosterBeforeUnknown)
+          expect(await harness.records()).toEqual(historyBeforeUnknown)
 
           /* ---------------------------------------------------------------- */
           /* Requirement 1.5: removal by removal, down to the empty roster    */
@@ -481,9 +506,9 @@ describe("Property 15: roster deletion preserves history, disabled entries are e
           for (let step = 0; model.length > 0; step += 1) {
             const index = nextIndex(strategy, model.length, picks[step] ?? 0)
             const target = model[index]
-            const listBefore = harness.registry.list()
-            const enabledBefore = harness.registry.listEnabled()
-            const historyBefore = snapshotHistory(harness)
+            const listBefore = await harness.roster()
+            const enabledBefore = await harness.enabled()
+            const historyBefore = await snapshotHistory(harness)
 
             const removed = await harness.registry.remove(target.id)
 
@@ -492,13 +517,12 @@ describe("Property 15: roster deletion preserves history, disabled entries are e
                 `expected ${target.id} to be removed, got ${removed.kind}`
               )
             }
-            expect(removed.persisted).toBe(true)
             model.splice(index, 1)
 
             // The entry is gone from every later roster response, and the
             // survivors keep their order: the roster is the pre-removal list
             // with exactly that entry filtered out.
-            const list = harness.registry.list()
+            const list = await harness.roster()
             expect(list).toEqual(
               listBefore.filter((entry) => entry.id !== target.id)
             )
@@ -511,7 +535,7 @@ describe("Property 15: roster deletion preserves history, disabled entries are e
 
             // Requirement 1.6 again: the fixed list of a later Redemption_Run
             // excludes the removed entry and every disabled one.
-            const enabled = harness.registry.listEnabled()
+            const enabled = await harness.enabled()
             expect(enabled).toEqual(
               enabledBefore.filter((entry) => entry.id !== target.id)
             )
@@ -520,22 +544,22 @@ describe("Property 15: roster deletion preserves history, disabled entries are e
               enabled.some((entry) => entry.hiveId === target.hiveId)
             ).toBe(false)
 
-            assertHistoryPreserved(harness, historyBefore, target.hiveId)
+            await assertHistoryPreserved(harness, historyBefore, target.hiveId)
           }
 
-          expect(harness.registry.list()).toEqual([])
-          expect(harness.registry.listEnabled()).toEqual([])
+          expect(await harness.roster()).toEqual([])
+          expect(await harness.enabled()).toEqual([])
 
           /* ---------------------------------------------------------------- */
           /* The history survived every removal, and nothing was warned about */
           /* ---------------------------------------------------------------- */
 
-          expect(harness.history.list()).toHaveLength(historySeeds.length)
-          expect(harness.history.list()).toEqual(historyBeforeUnknown)
+          expect(await harness.records()).toHaveLength(historySeeds.length)
+          expect(await harness.records()).toEqual(historyBeforeUnknown)
           expect(await harness.registry.remove("unknown-after")).toEqual({
             kind: "not-found",
           })
-          expect(harness.history.list()).toEqual(historyBeforeUnknown)
+          expect(await harness.records()).toEqual(historyBeforeUnknown)
           expect(harness.warnings).toEqual([])
         }
       ),

@@ -12,8 +12,9 @@
 //
 // Every case is asserted twice: through `parseMockMode`, the pure rule, and
 // through `resolveConfig` with an injected logger, which is where the warning of
-// Requirement 7.7 becomes observable. `APP_PASSPHRASE` and `SESSION_SECRET` are
-// supplied on every environment record so the only warning `resolveConfig` can
+// Requirement 7.7 becomes observable. `APP_PASSPHRASE`, `SESSION_SECRET`,
+// `MONGODB_URI`, both Clerk keys, and `ADMIN_EMAILS` are supplied on every
+// environment record so the only warning `resolveConfig` can
 // emit is the Mock_Mode one; the count is nevertheless taken over warnings
 // filtered to those naming `MOCK_MODE`, and the unrelated no-passphrase warning
 // is asserted absent, so a future warning cannot silently inflate the total.
@@ -68,6 +69,13 @@ function expectedBranch(raw: string | undefined): Branch {
 const BASE_ENV = {
   APP_PASSPHRASE: "property-test-passphrase",
   SESSION_SECRET: "property-test-session-secret",
+  // Supplied so the startup warnings of `mongodb-google-auth-admin`
+  // (Requirements 1.3, 5.2, 6.9) stay silent and the Mock_Mode warning remains
+  // the only one this environment record can produce. None is a real value.
+  MONGODB_URI: "mongodb://localhost:27017/property-test",
+  VITE_CLERK_PUBLISHABLE_KEY: "pk_test_property",
+  CLERK_SECRET_KEY: "sk_test_property",
+  ADMIN_EMAILS: "owner@example.com",
 }
 
 /** An environment record carrying `raw`, or omitting the variable entirely. */

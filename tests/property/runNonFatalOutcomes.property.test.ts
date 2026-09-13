@@ -43,10 +43,6 @@
  * Validates: Requirements 3.4, 3.5, 5.4
  */
 
-import { randomUUID } from "node:crypto"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
-
 import fc from "fast-check"
 import { describe, expect, it } from "vitest"
 
@@ -60,10 +56,10 @@ import type {
 import { createRunCoordinator } from "@/server/run/coordinator.server"
 import type { RunCoordinator } from "@/server/run/coordinator.server"
 import { createHistoryStore } from "@/server/store/history.server"
-import { createJsonStore } from "@/server/store/jsonStore.server"
 import { createMemberRegistryStore } from "@/server/store/memberRegistry.server"
 import type { UpstreamClient } from "@/server/upstream/client"
 
+import { createInMemoryMongoStore } from "../support/inMemoryMongoStore"
 import { StubUpstreamClient } from "../support/stubUpstreamClient"
 import type { StubScriptEntry } from "../support/stubUpstreamClient"
 import { NON_STOPPING_OUTCOMES, runScenarioArb } from "./generators"
@@ -157,11 +153,11 @@ async function createHarness(
   steps: readonly StubStep[],
   delayPosition: number
 ): Promise<Harness> {
-  const store = createJsonStore({
-    dataFilePath: join(tmpdir(), `scr-non-fatal-${randomUUID()}`, "store.json"),
-    flush: () => Promise.resolve(),
-    logger: { warn: () => undefined },
-  })
+  const handle = createInMemoryMongoStore()
+  /* The in-memory Mongo_Store of `tests/support/inMemoryMongoStore.ts`: no
+   * deployment and no file, and every operation served, so a `failed` result
+   * anywhere below is a genuine falsification. */
+  const store = handle.store
 
   let nextId = 0
   const registry = createMemberRegistryStore(store, {

@@ -57,12 +57,23 @@ import {
   THROTTLED_MESSAGE,
   getAuth,
 } from "@/server/auth.server"
+import { SIGN_IN_PATH } from "@/server/gate.server"
+
+import type { GateRejectionNeeds } from "@/server/gate.server"
 
 /** Name of the form field holding the submitted value. */
 const PASSPHRASE_FIELD = "passphrase"
 
 /** Query parameter naming a failed submission. */
 const ERROR_PARAM = "error"
+
+/**
+ * Query parameter carrying the gate's {@link GateRejectionNeeds} discriminator,
+ * so the page can say whether the passphrase alone is enough (a `member`,
+ * Requirement 7.2) or a sign-in is also required (an `anonymous`/`unknown`
+ * sender, Requirement 7.8).
+ */
+const NEEDS_PARAM = "needs"
 
 /** Code for an incorrect submission (Requirement 8.5). */
 const ERROR_INCORRECT = "incorrect"
@@ -72,6 +83,18 @@ const ERROR_THROTTLED = "throttled"
 
 /** `id` of the error message, referenced by the field's `aria-describedby`. */
 const ERROR_ELEMENT_ID = "passphrase-error"
+
+/**
+ * The `needs` value assumed when the query carries none, or carries a value
+ * this route does not recognize: the safe superset. Offering both the
+ * passphrase and sign-in can never lock a sender out — a member who only needs
+ * the passphrase can ignore the sign-in link — whereas the narrower
+ * "passphrase" copy would hide sign-in from a sender who needs it. This mirrors
+ * how {@link errorMessage} maps an unknown code to null (Requirement 8.10): an
+ * attacker-chosen query value selects one of two fixed sentences, never text of
+ * its own.
+ */
+const DEFAULT_NEEDS: GateRejectionNeeds = "passphrase-and-sign-in"
 
 /**
  * Where a granted Session lands. The redemption page, which is what the sender
@@ -90,6 +113,12 @@ interface LoginView {
   readonly error: string | null
   /** A fixed informational message, or null. */
   readonly notice: string | null
+  /**
+   * What the sender must do to be admitted (Requirements 7.2, 7.8). Drives the
+   * sign-in link's copy; one of two fixed discriminator values, never a value
+   * echoed from the query.
+   */
+  readonly needs: GateRejectionNeeds
 }
 
 /**
@@ -101,6 +130,7 @@ const CLIENT_NAVIGATION_VIEW: LoginView = {
   passphraseRequired: true,
   error: null,
   notice: null,
+  needs: DEFAULT_NEEDS,
 }
 
 /**
@@ -115,6 +145,30 @@ function errorMessage(code: string | null): string | null {
     return THROTTLED_MESSAGE
   }
   return null
+}
+
+/**
+ * The {@link GateRejectionNeeds} a query value names, or {@link DEFAULT_NEEDS}
+ * when the value is absent or is not one the gate issues. Like
+ * {@link errorMessage}, this is the only place a query value turns into
+ * behaviour, and it can only ever select between the two fixed discriminator
+ * values — a crafted query cannot put attacker-chosen text on the page
+ * (Requirement 8.10).
+ */
+function needsFrom(value: string | null): GateRejectionNeeds {
+  return value === "passphrase" ? "passphrase" : DEFAULT_NEEDS
+}
+
+/**
+ * The instruction shown beside the sign-in link, chosen by the discriminator.
+ * A `member` needs only the passphrase (Requirement 7.2); an anonymous or
+ * unknown sender needs both the passphrase and a sign-in (Requirement 7.8).
+ * Both are fixed sentences.
+ */
+function signInCopy(needs: GateRejectionNeeds): string {
+  return needs === "passphrase"
+    ? "Already signed in? Submit the passphrase above to continue."
+    : "New here? Submit the passphrase above and sign in to continue."
 }
 
 /**
@@ -170,13 +224,15 @@ export const Route = createFileRoute("/login")({
          */
         GET: ({ request, next }) => {
           const passphraseRequired = getAuth().passphraseRequired()
-          const code = new URL(request.url).searchParams.get(ERROR_PARAM)
+          const params = new URL(request.url).searchParams
+          const code = params.get(ERROR_PARAM)
           return next({
             context: {
               login: {
                 passphraseRequired,
                 error: passphraseRequired ? errorMessage(code) : null,
                 notice: passphraseRequired ? null : GATE_DISABLED_MESSAGE,
+                needs: needsFrom(params.get(NEEDS_PARAM)),
               } satisfies LoginView,
             },
           })
@@ -222,7 +278,7 @@ export const Route = createFileRoute("/login")({
 })
 
 function LoginPage() {
-  const { passphraseRequired, error, notice } = Route.useLoaderData()
+  const { passphraseRequired, error, notice, needs } = Route.useLoaderData()
 
   return (
     <main className="flex min-h-svh items-center justify-center p-6">
@@ -272,6 +328,21 @@ function LoginPage() {
               <AlertDescription>{notice}</AlertDescription>
             </Alert>
           )}
+
+          {/*
+           * The sign-in link, always offered: it is safe whatever the sender
+           * needs (a member can ignore it), and a Requirement 7.8 rejection
+           * needs it reachable. Its instruction is chosen by `needs` — one of
+           * two fixed sentences (Requirements 7.2, 7.8) — while the link itself
+           * is a plain anchor to SIGN_IN_PATH, so the whole flow works with
+           * JavaScript disabled.
+           */}
+          <div className="mt-4 flex flex-col gap-2 border-t pt-4">
+            <p className="text-sm text-muted-foreground">{signInCopy(needs)}</p>
+            <Button asChild variant="outline">
+              <a href={SIGN_IN_PATH}>Sign in with Google</a>
+            </Button>
+          </div>
         </CardContent>
       </Card>
     </main>

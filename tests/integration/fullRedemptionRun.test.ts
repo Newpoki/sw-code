@@ -63,10 +63,6 @@
  * asserts was never called.
  */
 
-import { randomUUID } from "node:crypto"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
-
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import { parseUpstreamBody } from "@/domain/responseParser"
@@ -86,7 +82,6 @@ import {
 import type { RedemptionCollaborators } from "@/server/run/redemptionRequest.server"
 import { createHistoryStore } from "@/server/store/history.server"
 import type { HistoryStore } from "@/server/store/history.server"
-import { createJsonStore } from "@/server/store/jsonStore.server"
 import { createMemberRegistryStore } from "@/server/store/memberRegistry.server"
 import type { UpstreamClient } from "@/server/upstream/client"
 import {
@@ -105,6 +100,7 @@ import {
   StubUpstreamClient,
   respondWithBody,
 } from "../support/stubUpstreamClient"
+import { createInMemoryMongoStore } from "../support/inMemoryMongoStore"
 
 /** Fixed clock, so `startedAt` and `completedAt` are predictable. */
 const FIXED_TIME = Date.parse("2025-01-06T11:15:00.000Z")
@@ -188,11 +184,10 @@ interface Harness {
  * pure function of the roster and the scripted responses.
  */
 async function createHarness(upstream: UpstreamClient): Promise<Harness> {
-  const store = createJsonStore({
-    dataFilePath: join(tmpdir(), `scr-full-run-${randomUUID()}`, "store.json"),
-    flush: () => Promise.resolve(),
+  const handle = createInMemoryMongoStore({
     logger: { warn: () => undefined },
   })
+  const store = handle.store
 
   let nextMemberId = 0
   const registry = createMemberRegistryStore(store, {
@@ -481,12 +476,16 @@ function expectResultSet(
  * carries the empty response code and the empty response message, because no
  * request was ever issued for that Group_Member.
  */
-function expectHistoryRecord(
+async function expectHistoryRecord(
   history: HistoryStore,
   result: RedemptionRunResult,
   rows: readonly ExpectedRow[]
-): void {
-  const records = history.list()
+): Promise<void> {
+  const listed = await history.list()
+  if (listed.kind !== "records") {
+    throw new Error(`the history read reported "${listed.kind}"`)
+  }
+  const records = listed.records
   expect(
     records,
     "exactly one record per completed Redemption_Run"
@@ -651,7 +650,7 @@ describe("a full Redemption_Run over a roster holding disabled entries", () => {
       })
 
       /* 5. The one appended Redemption_History record (Requirement 6.5). */
-      expectHistoryRecord(history, result, runCase.rows)
+      await expectHistoryRecord(history, result, runCase.rows)
 
       // The lock is released, so the next request is admitted.
       expect(readActiveRun(coordinator).ok).toBe(true)
@@ -739,7 +738,7 @@ describe("the requests a full Redemption_Run issues (Requirements 3.3, 3.4)", ()
       mock: false,
       stoppedEarly: false,
     })
-    expectHistoryRecord(history, result, rows)
+    await expectHistoryRecord(history, result, rows)
   })
 })
 
@@ -831,7 +830,7 @@ describe("readActiveRun during and after a Redemption_Run", () => {
       mock: false,
       stoppedEarly: false,
     })
-    expectHistoryRecord(history, result, rows)
+    await expectHistoryRecord(history, result, rows)
 
     // The coordinator released its lock in its `finally`, so the read is idle
     // again the moment the terminal event has landed.

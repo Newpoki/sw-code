@@ -38,6 +38,10 @@
  * machine-readable in the `dateTime` attribute of the `<time>` element.
  */
 
+import {
+  HISTORY_UNAVAILABLE_TITLE,
+  StoreFailureNotice,
+} from "@/components/StoreFailureNotice"
 import { Badge } from "@/components/ui/badge"
 import {
   Drawer,
@@ -247,13 +251,37 @@ export interface HistoryTableProps {
    */
   readonly records: readonly RedemptionHistoryRecord[]
   readonly className?: string
+  /**
+   * The store's own sentence when the Redemption_History read did not complete,
+   * or null when it did (Requirement 3.10).
+   *
+   * A failed read withholds every partially read record, so there is nothing to
+   * put in a table and nothing that justifies the Requirement 6.9 message either:
+   * "no run has been recorded" is a statement about the collection, and a read
+   * that failed learned nothing about the collection.
+   */
+  readonly readFailureMessage?: string | null
 }
 
 /**
- * The retained Redemption_History records, or the Requirement 6.9 message when
- * there is no record to show.
+ * The retained Redemption_History records, the Requirement 6.9 message when there
+ * is no record to show, or the store's sentence when the read did not complete.
  */
-export function HistoryTable({ records, className }: HistoryTableProps) {
+export function HistoryTable({
+  records,
+  className,
+  readFailureMessage = null,
+}: HistoryTableProps) {
+  if (readFailureMessage !== null) {
+    /* Requirement 3.10, in place of the table and in place of the empty state. */
+    return (
+      <StoreFailureNotice
+        title={HISTORY_UNAVAILABLE_TITLE}
+        message={readFailureMessage}
+      />
+    )
+  }
+
   if (records.length === 0) {
     /*
      * Requirement 6.9. `role="status"` so the message is announced when the

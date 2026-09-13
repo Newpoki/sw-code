@@ -64,7 +64,6 @@ import {
 import type { RunCoordinator } from "@/server/run/coordinator.server"
 import { createHistoryStore } from "@/server/store/history.server"
 import type { HistoryStore } from "@/server/store/history.server"
-import { createJsonStore } from "@/server/store/jsonStore.server"
 import { createMemberRegistryStore } from "@/server/store/memberRegistry.server"
 import {
   MOCK_FIXTURE_NAMES,
@@ -82,6 +81,7 @@ import {
   respondWithBody,
 } from "../support/stubUpstreamClient"
 import type { StubGateContext } from "../support/stubUpstreamClient"
+import { createInMemoryMongoStore } from "../support/inMemoryMongoStore"
 
 /** Fixed clock, so two runs of the same roster and script are comparable. */
 const FIXED_TIME = Date.parse("2025-01-06T09:30:00.000Z")
@@ -180,12 +180,10 @@ async function createHarness(
   roster: readonly RosterSeed[],
   upstream: UpstreamClient
 ): Promise<Harness> {
-  const directory = await temporaryDirectory("scr-preflight-store-")
-  const store = createJsonStore({
-    dataFilePath: join(directory, "store.json"),
-    flush: () => Promise.resolve(),
+  const handle = createInMemoryMongoStore({
     logger: { warn: () => undefined },
   })
+  const store = handle.store
 
   let nextMemberId = 0
   const registry = createMemberRegistryStore(store, {
@@ -303,8 +301,12 @@ describe("no enabled Group_Member (Requirement 3.8)", () => {
       const rejection = expectPreflightRejection(events, COUPON_CODE)
       expect(rejection.message).toBe(noEnabledMembersMessage())
       expect(upstream.callCount, "no Upstream_API request was issued").toBe(0)
+      const listed = await history.list()
+      if (listed.kind !== "records") {
+        throw new Error(`the history read reported "${listed.kind}"`)
+      }
       expect(
-        history.list(),
+        listed.records,
         "no Redemption_History record was appended"
       ).toEqual([])
     }
@@ -361,10 +363,15 @@ async function runInMockMode(fixtureDir: string): Promise<MockRejection> {
   // run (Requirement 7.9 reads on the same flag).
   expect(rejection.result.mock).toBe(true)
 
+  const listed = await history.list()
+  if (listed.kind !== "records") {
+    throw new Error(`the history read reported "${listed.kind}"`)
+  }
+
   return {
     rejection,
     callCount: useCoupon.mock.calls.length,
-    historyLength: history.list().length,
+    historyLength: listed.records.length,
   }
 }
 
@@ -528,7 +535,11 @@ describe("a second redemption request during an active run (Requirement 3.9)", (
     )
 
     // Exactly one Redemption_History record: the first run's, not two.
-    const records = history.list()
+    const listed = await history.list()
+    if (listed.kind !== "records") {
+      throw new Error(`the history read reported "${listed.kind}"`)
+    }
+    const records = listed.records
     expect(records).toHaveLength(1)
     expect(records[0].couponCode).toBe(COUPON_CODE)
     expect(records[0].outcomes).toHaveLength(CONTENDED_ROSTER.length)

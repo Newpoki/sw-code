@@ -28,6 +28,10 @@
 
 import { useState } from "react"
 
+import {
+  ROSTER_UNAVAILABLE_TITLE,
+  StoreFailureNotice,
+} from "@/components/StoreFailureNotice"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -84,9 +88,24 @@ export interface RosterTableProps {
   readonly errorMessage?: string | null
   /** Persistence warning of the last successful write (Requirement 1.8). */
   readonly warningMessage?: string | null
+  /**
+   * The store's own sentence when the roster read did not complete, or null when
+   * it did (Requirement 2.14).
+   *
+   * Separate from {@link errorMessage} because the two are not the same claim:
+   * `errorMessage` qualifies a *write* over a roster that was read, so the rows
+   * stay on screen next to it, while this one means there are no rows to show and
+   * none are claimed. It therefore replaces the table and the empty state rather
+   * than accompanying either — an unreachable database and an empty roster must
+   * not read the same.
+   */
+  readonly readFailureMessage?: string | null
 }
 
-/** The roster table, or the empty state when the Member_Registry holds nothing. */
+/**
+ * The roster table, the empty state when the Member_Registry holds nothing, or
+ * the store's sentence when the read did not complete.
+ */
 export function RosterTable({
   entries,
   onSetEnabled,
@@ -94,6 +113,7 @@ export function RosterTable({
   pendingMemberId = null,
   errorMessage = null,
   warningMessage = null,
+  readFailureMessage = null,
 }: RosterTableProps) {
   return (
     <div className="flex flex-col gap-3">
@@ -114,7 +134,16 @@ export function RosterTable({
         </Alert>
       ) : null}
 
-      {entries.length === 0 ? (
+      {readFailureMessage !== null ? (
+        /* Requirement 2.14: the read produced no rows *and* no knowledge of the
+         * roster, so the store's sentence stands where the table would, and the
+         * empty-roster message of Requirement 1.10 is deliberately not shown —
+         * nothing here knows whether the roster is empty. */
+        <StoreFailureNotice
+          title={ROSTER_UNAVAILABLE_TITLE}
+          message={readFailureMessage}
+        />
+      ) : entries.length === 0 ? (
         /* Requirement 1.10. `role="status"` so it is announced when the last
          * entry is removed and the table is replaced by this message. */
         <p role="status" className="text-sm text-muted-foreground">

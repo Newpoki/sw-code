@@ -16,22 +16,24 @@
  * individual assertions: a store that reordered survivors, admitted a duplicate,
  * or grew past the cap would no longer equal the model.
  *
- * The flush is stubbed to resolve, so `persisted` must be true on every
- * successful mutation and the warning sink must stay empty — that is the
- * Requirement 1.12 half of the property. No file is written: the store is built
- * over an unused temporary path with the filesystem write replaced.
+ * The store is the in-memory Mongo_Store of `tests/support/inMemoryMongoStore.ts`
+ * and every operation is `async`, reads included. "Append order" is now the
+ * `position` field ascending, assigned by the `member_position` counter, and the
+ * database applies it — which is why the model, an array in insertion order, is
+ * still the right prediction of it.
+ *
+ * The Requirement 1.12 half of the property changed shape. Nothing reports
+ * `persisted` any more: a `kind` of `added`, `updated`, or `removed` means the
+ * write is in the database (Requirement 2.9 of mongodb-google-auth-admin), so
+ * what is asserted instead is that every successful mutation reports one of
+ * those, that no operation answers `failed`, and that nothing is logged.
  *
  * Requirements 1.1, 1.4, 1.9, 1.11, 1.12.
  */
 
-import { randomUUID } from "node:crypto"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
-
 import fc from "fast-check"
 import { describe, expect, it } from "vitest"
 
-import { createJsonStore } from "@/server/store/jsonStore.server"
 import {
   MEMBER_REGISTRY_MAX_ENTRIES,
   createMemberRegistryStore,
@@ -39,6 +41,7 @@ import {
 import type { MemberRegistryStore } from "@/server/store/memberRegistry.server"
 import type { MemberRegistryEntry } from "@/domain/types"
 
+import { createInMemoryMongoStore } from "../support/inMemoryMongoStore"
 import {
   validHiveIdArb,
   validMemberLabelArb,
@@ -172,31 +175,21 @@ const operationsArb: fc.Arbitrary<Array<RosterOperation>> = fc.array(
 
 interface Harness {
   readonly registry: MemberRegistryStore
-  /** Everything the store logged. Requirement 1.12 expects this to stay empty. */
-  readonly warnings: Array<string>
+  /** Everything the store logged. Nothing here fails, so it stays empty. */
+  readonly warnings: readonly string[]
 }
 
 /**
- * A Member_Registry over a store that touches no filesystem: the flush resolves
- * immediately, so every mutation is durable by construction, and the data file
- * path points at a directory that is never created.
+ * A Member_Registry over an in-memory Mongo_Store: no deployment, no
+ * filesystem, and every write served, so a `failed` result anywhere below is a
+ * genuine falsification rather than an arranged one.
  */
 function createHarness(): Harness {
-  const warnings: Array<string> = []
+  const handle = createInMemoryMongoStore()
   let nextId = 0
   let clock = Date.parse("2025-01-04T18:00:00.000Z")
 
-  const store = createJsonStore({
-    dataFilePath: join(tmpdir(), `scr-property-${randomUUID()}`, "store.json"),
-    flush: () => Promise.resolve(),
-    logger: {
-      warn: (message) => {
-        warnings.push(message)
-      },
-    },
-  })
-
-  const registry = createMemberRegistryStore(store, {
+  const registry = createMemberRegistryStore(handle.store, {
     generateId: () => {
       nextId += 1
       return `m-${nextId}`
@@ -207,7 +200,29 @@ function createHarness(): Harness {
     },
   })
 
-  return { registry, warnings }
+  return { registry, warnings: handle.warnings }
+}
+
+/** The stored roster in position order, or a thrown explanation. */
+async function entriesOf(
+  registry: MemberRegistryStore
+): Promise<readonly MemberRegistryEntry[]> {
+  const listed = await registry.list()
+  if (listed.kind !== "entries") {
+    throw new Error(`the roster read reported "${listed.kind}"`)
+  }
+  return listed.entries
+}
+
+/** The enabled entries in position order, or a thrown explanation. */
+async function enabledEntriesOf(
+  registry: MemberRegistryStore
+): Promise<readonly MemberRegistryEntry[]> {
+  const listed = await registry.listEnabled()
+  if (listed.kind !== "entries") {
+    throw new Error(`the enabled roster read reported "${listed.kind}"`)
+  }
+  return listed.entries
 }
 
 /**
@@ -250,7 +265,7 @@ async function applyAdd(
   memberLabel: string,
   hiveId: string
 ): Promise<void> {
-  const before = harness.registry.list()
+  const before = await entriesOf(harness.registry)
   const trimmedHiveId = hiveId.trim()
   const conflict = model.find((entry) => entry.hiveId === trimmedHiveId)
 
@@ -261,14 +276,14 @@ async function applyAdd(
       kind: "duplicate",
       conflictingLabel: conflict.memberLabel,
     })
-    expect(harness.registry.list()).toEqual(before)
+    expect(await entriesOf(harness.registry)).toEqual(before)
     return
   }
 
   if (model.length >= MEMBER_REGISTRY_MAX_ENTRIES) {
     expect(result).toEqual({ kind: "full" })
     expect(before).toHaveLength(MEMBER_REGISTRY_MAX_ENTRIES)
-    expect(harness.registry.list()).toEqual(before)
+    expect(await entriesOf(harness.registry)).toEqual(before)
     return
   }
 
@@ -285,8 +300,6 @@ async function applyAdd(
   expect(result.entry.memberLabel).toBe(memberLabel.trim())
   expect(result.entry.hiveId).toBe(trimmedHiveId)
   expect(result.entry.enabled).toBe(true)
-  // Requirement 1.12: the write completed, so the mutation is durable.
-  expect(result.persisted).toBe(true)
 
   model.push(result.entry)
 }
@@ -341,7 +354,6 @@ async function applyOperation(
       // Requirement 1.9: the submitted state is stored and the updated entry is
       // returned with its Member_Label and Hive_ID untouched.
       expect(result.entry).toEqual({ ...target, enabled: operation.enabled })
-      expect(result.persisted).toBe(true)
 
       model[index] = result.entry
       return
@@ -359,28 +371,27 @@ async function applyOperation(
           `expected ${target.id} to be removed, got ${result.kind}`
         )
       }
-      expect(result.persisted).toBe(true)
 
       model.splice(index, 1)
       return
     }
 
     case "set-enabled-unknown": {
-      const before = harness.registry.list()
+      const before = await entriesOf(harness.registry)
       const result = await harness.registry.setEnabled(
         `unknown-${operation.token}`,
         operation.enabled
       )
       expect(result).toEqual({ kind: "not-found" })
-      expect(harness.registry.list()).toEqual(before)
+      expect(await entriesOf(harness.registry)).toEqual(before)
       return
     }
 
     case "remove-unknown": {
-      const before = harness.registry.list()
+      const before = await entriesOf(harness.registry)
       const result = await harness.registry.remove(`unknown-${operation.token}`)
       expect(result).toEqual({ kind: "not-found" })
-      expect(harness.registry.list()).toEqual(before)
+      expect(await entriesOf(harness.registry)).toEqual(before)
       return
     }
   }
@@ -412,14 +423,14 @@ async function fillToCap(
 }
 
 /** The invariants that hold after every single operation. */
-function assertInvariants(
+async function assertInvariants(
   harness: Harness,
   model: ReadonlyArray<MemberRegistryEntry>
-): void {
-  const list = harness.registry.list()
+): Promise<void> {
+  const list = await entriesOf(harness.registry)
 
-  // Order and content: append order for an add, in-place replacement for
-  // `setEnabled`, gap closed without reordering for a `remove`
+  // Order and content: position order for an add, in-place replacement for
+  // `setEnabled`, gap closed without renumbering for a `remove`
   // (Requirements 1.4, 1.9).
   expect(list).toEqual(model)
 
@@ -434,11 +445,11 @@ function assertInvariants(
 
   // Requirement 1.6 read of the same order: the fixed list of a Redemption_Run
   // is the enabled entries in roster order.
-  expect(harness.registry.listEnabled()).toEqual(
+  expect(await enabledEntriesOf(harness.registry)).toEqual(
     model.filter((entry) => entry.enabled)
   )
 
-  // Requirement 1.12: every write above succeeded, so nothing was warned about.
+  // Every operation above was served, so nothing was warned about.
   expect(harness.warnings).toEqual([])
 }
 
@@ -467,12 +478,12 @@ describe("Member_Registry mutation invariants", () => {
 
           if (startAtCap) {
             await fillToCap(harness, model)
-            assertInvariants(harness, model)
+            await assertInvariants(harness, model)
           }
 
           for (const operation of operations) {
             await applyOperation(harness, model, operation)
-            assertInvariants(harness, model)
+            await assertInvariants(harness, model)
           }
         }
       ),

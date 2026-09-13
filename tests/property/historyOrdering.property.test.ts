@@ -6,49 +6,63 @@
 //
 // Validates: Requirements 6.6.
 //
+// ## What this file still owns, and what moved
+//
+// The ordering rule moved out of the application and into the database: it is a
+// sort on `{ completedAtMs: -1, seq: -1 }` served by the `completedAtMs_desc`
+// index, and no comparator lives in `history.server.ts` any more. Property 9 of
+// `mongodb-google-auth-admin`
+// (`tests/property/historyReadOrder.property.test.ts`) states that ordering over
+// generated Store_Documents, with generators that reach records sharing an
+// instant, timestamps spelling one instant two ways, and Coupon_Codes differing
+// only in case or surrounding whitespace.
+//
+// So this file keeps the claims Property 9 does not make and narrows the ones it
+// does:
+//
+//   - **Kept.** The ordering asserted end to end through `append`, so the value
+//     the append path derives for `completedAtMs` is the value the read sorts on
+//     rather than one a seed supplied. The `seq` counter climbing with every
+//     append. The limit semantics of `list` — floored, clamped, non-finite
+//     limits reading as "the whole window", and a negative limit returning
+//     nothing — which Requirement 6.6 is silent about and which nothing else
+//     pins.
+//   - **Narrowed.** The Coupon_Code lookup is asserted only to agree with the
+//     first record of the read order. Its exactness — that a differing letter
+//     case or a differing surrounding whitespace run is a different code — is
+//     Property 9's claim, made there over generated variants rather than over
+//     the two probes this file used to spell out.
+//
 // ## How the ordering rule is stated here
 //
-// The store's own comparator is module-private and is deliberately not reused:
-// re-sorting `list()` with it would only prove that sorting twice is
-// idempotent. Instead every assertion below states the rule from scratch —
-// adjacent pairs of the returned sequence must be non-increasing by instant,
-// and must be strictly decreasing by `seq` whenever two records land on the
-// same instant. `Date.parse` is used for the comparison because Requirement 6.6
-// speaks of a completion timestamp, not of its spelling: the generator emits
-// both `...Z` and `...+01:00` renderings of the same moment, so records that are
-// textually different but simultaneous fall to the `seq` tie-break.
+// From scratch, not borrowed: adjacent pairs of the returned sequence must be
+// non-increasing by instant, and strictly decreasing by `seq` whenever two
+// records land on the same instant. `Date.parse` is used for the comparison
+// because Requirement 6.6 speaks of a completion timestamp, not of its spelling:
+// the generator emits both `...Z` and `...+01:00` renderings of the same moment,
+// so records that are textually different but simultaneous fall to the `seq`
+// tie-break.
 //
-// ## Why no file is written
+// ## No deployment and no file
 //
-// Ordering is a pure read over the in-memory document, so every sample injects
-// a resolving flush and a `DATA_FILE` path that is never created. Nothing here
-// touches the repository's `./data/store.json`, and the durable round trip is
-// covered by `persistenceRoundTrip.property.test.ts` instead.
-//
-// ## A note on `list(-3)`
-//
-// `HistoryStore.list` short-circuits only on `undefined` and non-finite limits;
-// a negative finite limit is clamped to zero and floors into an empty slice.
-// Requirement 6.6 says nothing about a negative limit and no caller passes one,
-// so this test is what defines the contract, and the doc comment on `list` was
-// corrected in task 16.1 to state exactly this behaviour.
-
-import { tmpdir } from "node:os"
-import { join } from "node:path"
+// Both stores run over the in-memory Mongo_Store of
+// `tests/support/inMemoryMongoStore.ts`. Every operation is awaited and every
+// one of them is served, so a `failed` result below falsifies the property. The
+// durable round trip stays with the fixture-backed integration suite.
 
 import fc from "fast-check"
 import { describe, expect, it } from "vitest"
 
 import { MEMBER_OUTCOME_VALUES } from "@/domain/types"
-import { createJsonStore } from "@/server/store/jsonStore.server"
 import {
   createHistoryStore,
   toHistoryOutcomeRows,
 } from "@/server/store/history.server"
-import type { JsonStore, StoreLogger } from "@/server/store/jsonStore.server"
 import type { HistoryStore } from "@/server/store/history.server"
 import type { MemberOutcome, RedemptionHistoryRecord } from "@/domain/types"
 
+import { createInMemoryMongoStore } from "../support/inMemoryMongoStore"
+import type { InMemoryMongoStoreHandle } from "../support/inMemoryMongoStore"
 import {
   trimmedCouponCodeArb,
   trimmedHiveIdArb,
@@ -61,26 +75,25 @@ const BASE_TIME = Date.parse("2025-01-04T18:00:00.000Z")
 /** Kept well under `HISTORY_RETENTION_LIMIT`, so no sample is ever trimmed. */
 const MAX_APPENDS = 25
 
-/** No warning is expected: the injected flush resolves and no file is read. */
-const silentLogger: StoreLogger = { warn: () => undefined }
+/** A fresh in-memory store holding no Store_Document. */
+function emptyStore(): InMemoryMongoStoreHandle {
+  return createInMemoryMongoStore()
+}
 
-let storeCounter = 0
+/** A Redemption_History over `handle`, with its capturing logger installed. */
+function historyOver(handle: InMemoryMongoStoreHandle): HistoryStore {
+  return createHistoryStore(handle.store, { logger: handle.logger })
+}
 
-/**
- * A store whose flush resolves without touching the filesystem, over a
- * `DATA_FILE` path that is unique per store and never created — so the load
- * path starts from an empty document every time.
- */
-function emptyStore(): JsonStore {
-  storeCounter += 1
-  return createJsonStore({
-    dataFilePath: join(
-      tmpdir(),
-      `scr-history-ordering-${process.pid}-${storeCounter}.unused.json`
-    ),
-    flush: () => Promise.resolve(),
-    logger: silentLogger,
-  })
+/** The records one read returned, or a thrown explanation. */
+async function recordsOf(
+  read: Promise<Awaited<ReturnType<HistoryStore["list"]>>>
+): Promise<ReadonlyArray<RedemptionHistoryRecord>> {
+  const listed = await read
+  if (listed.kind !== "records") {
+    throw new Error(`the history read reported "${listed.kind}"`)
+  }
+  return listed.records
 }
 
 /* -------------------------------------------------------------------------- */
@@ -189,7 +202,7 @@ async function appendAll(
 ): Promise<Array<number>> {
   const seqs: Array<number> = []
   for (const [index, seed] of seeds.entries()) {
-    const { persisted, record } = await history.append({
+    const appended = await history.append({
       runId: `run-${index}`,
       couponCode: seed.useSharedCode ? sharedCouponCode : seed.ownCouponCode,
       completedAt: completedAtOf(seed),
@@ -197,9 +210,13 @@ async function appendAll(
       stoppedEarly: seed.stoppedEarly,
       outcomes: outcomeRowsOf(seed),
     })
-    // The injected flush resolves, so every append is durable.
-    expect(persisted).toBe(true)
-    seqs.push(record.seq)
+    /* Every append is served, so `appended` means the Store_Document is in the
+     * collection (Requirement 3.12); there is no `persisted` flag any more. */
+    expect(appended.kind).toBe("appended")
+    if (appended.kind !== "appended") {
+      throw new Error(`the append reported "${appended.kind}"`)
+    }
+    seqs.push(appended.record.seq)
   }
   return seqs
 }
@@ -289,21 +306,6 @@ function latestFor(
   return best
 }
 
-/**
- * A Coupon_Code no generator can produce: `trimmedCouponCodeArb` builds its
- * values from non-whitespace units only, so anything holding a space is
- * guaranteed absent from the history.
- */
-const ABSENT_COUPON_CODE = "NO SUCH COUPON CODE"
-
-/** The same code in the other letter case, or null when case makes no difference. */
-function caseVariantOf(couponCode: string): string | null {
-  const upper = couponCode.toUpperCase()
-  if (upper !== couponCode) return upper
-  const lower = couponCode.toLowerCase()
-  return lower === couponCode ? null : lower
-}
-
 /* -------------------------------------------------------------------------- */
 /* Property 16                                                                */
 /* -------------------------------------------------------------------------- */
@@ -316,8 +318,8 @@ describe("Property 16: history ordering is total and stable", () => {
         trimmedCouponCodeArb,
         fc.nat({ max: MAX_APPENDS + 3 }),
         async (seeds, sharedCouponCode, limit) => {
-          const store = emptyStore()
-          const history = createHistoryStore(store)
+          const handle = emptyStore()
+          const history = historyOver(handle)
           const appendedSeqs = await appendAll(history, seeds, sharedCouponCode)
 
           /* `seq` climbs with every append and is never reused. */
@@ -326,7 +328,7 @@ describe("Property 16: history ordering is total and stable", () => {
             expect(appendedSeqs[index + 1]).toBeGreaterThan(appendedSeqs[index])
           }
 
-          const records = history.list()
+          const records = await recordsOf(history.list())
 
           /* Totality: nothing is dropped and nothing is duplicated. */
           expect(records).toHaveLength(seeds.length)
@@ -335,35 +337,53 @@ describe("Property 16: history ordering is total and stable", () => {
             [...appendedSeqs].sort(ascending)
           )
 
-          /* Requirement 6.6 itself. */
+          /* Requirement 6.6 itself, over what the append path derived. */
           expectRequirement66Order(records)
           expectSeqDescendingWithinInstants(records)
 
-          /* Stability: the same document reads back the same sequence. */
-          expect(history.list()).toEqual(records)
-          expect(createHistoryStore(store).list()).toEqual(records)
+          /* Stability: the same collection reads back the same sequence, and so
+           * does a second store over it — the restart clause of Requirement 3.6
+           * minus the durability half. */
+          expect(await recordsOf(history.list())).toEqual(records)
+          const restarted = createInMemoryMongoStore({
+            backing: handle.backing,
+          })
+          expect(await recordsOf(historyOver(restarted).list())).toEqual(
+            records
+          )
 
           /* The cap is applied AFTER ordering, so the newest survive it. */
-          expect(history.list(limit)).toEqual(records.slice(0, limit))
-          expect(history.list(0)).toEqual([])
-          expect(history.list(records.length + 1)).toEqual(records)
-          expect(history.list(undefined)).toEqual(records)
+          expect(await recordsOf(history.list(limit))).toEqual(
+            records.slice(0, limit)
+          )
+          expect(await recordsOf(history.list(0))).toEqual([])
+          expect(await recordsOf(history.list(records.length + 1))).toEqual(
+            records
+          )
+          expect(await recordsOf(history.list(undefined))).toEqual(records)
 
           /* A fractional limit is floored. */
-          expect(history.list(2.7)).toEqual(records.slice(0, 2))
-          expect(history.list(0.9)).toEqual([])
+          expect(await recordsOf(history.list(2.7))).toEqual(
+            records.slice(0, 2)
+          )
+          expect(await recordsOf(history.list(0.9))).toEqual([])
 
           /* Non-finite limits return everything. */
-          expect(history.list(Number.POSITIVE_INFINITY)).toEqual(records)
-          expect(history.list(Number.NEGATIVE_INFINITY)).toEqual(records)
-          expect(history.list(Number.NaN)).toEqual(records)
+          expect(
+            await recordsOf(history.list(Number.POSITIVE_INFINITY))
+          ).toEqual(records)
+          expect(
+            await recordsOf(history.list(Number.NEGATIVE_INFINITY))
+          ).toEqual(records)
+          expect(await recordsOf(history.list(Number.NaN))).toEqual(records)
 
-          // A negative finite limit is clamped to zero and floors into an empty
-          // slice. See the note at the top of this file: Requirement 6.6 is
-          // silent on the case, so this assertion is the contract.
-          expect(history.list(-3)).toEqual([])
+          /* A negative finite limit is clamped to zero and returns nothing.
+           * Requirement 6.6 is silent on the case and no caller passes one, so
+           * this assertion is the contract. */
+          expect(await recordsOf(history.list(-3))).toEqual([])
 
-          await store.whenIdle()
+          /* Every append and every read was served, so nothing was logged. */
+          expect(handle.warnings).toEqual([])
         }
       ),
       { numRuns: 100 }
@@ -382,39 +402,30 @@ describe("Property 16: history ordering is total and stable", () => {
         ),
         trimmedCouponCodeArb,
         async (seeds, sharedCouponCode) => {
-          const store = emptyStore()
-          const history = createHistoryStore(store)
+          const handle = emptyStore()
+          const history = historyOver(handle)
           await appendAll(history, seeds, sharedCouponCode)
 
-          const records = history.list()
+          const records = await recordsOf(history.list())
           expectRequirement66Order(records)
 
-          /* The latest match, and the first match of the ordering, agree. */
-          const found = history.findLatestByCouponCode(sharedCouponCode)
-          expect(found).toEqual(latestFor(records, sharedCouponCode))
-          expect(found).toEqual(
+          /* The latest match, and the first match of the ordering, agree.
+           *
+           * That agreement is all this case claims. Requirement 6.7's exactness
+           * — a differing letter case or a differing surrounding whitespace run
+           * is a different Coupon_Code — is Property 9 of
+           * mongodb-google-auth-admin, which generates those variants rather
+           * than probing two of them. */
+          const found = await history.findLatestByCouponCode(sharedCouponCode)
+          expect(found.kind).toBe("record")
+          if (found.kind !== "record") return
+          expect(found.record).toEqual(latestFor(records, sharedCouponCode))
+          expect(found.record).toEqual(
             records.find((record) => record.couponCode === sharedCouponCode)
           )
-          expect(found?.couponCode).toBe(sharedCouponCode)
+          expect(found.record.couponCode).toBe(sharedCouponCode)
 
-          /* No match: null, not a near miss. */
-          expect(history.findLatestByCouponCode(ABSENT_COUPON_CODE)).toBeNull()
-
-          /* Surrounding whitespace is not trimmed away before comparing. */
-          expect(
-            history.findLatestByCouponCode(` ${sharedCouponCode} `)
-          ).toBeNull()
-          expect(
-            history.findLatestByCouponCode(`${sharedCouponCode}\n`)
-          ).toBeNull()
-
-          /* Letter case is compared, not folded. */
-          const variant = caseVariantOf(sharedCouponCode)
-          if (variant !== null) {
-            expect(history.findLatestByCouponCode(variant)).toBeNull()
-          }
-
-          await store.whenIdle()
+          expect(handle.warnings).toEqual([])
         }
       ),
       { numRuns: 100 }

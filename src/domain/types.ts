@@ -152,6 +152,26 @@ export interface RedemptionHistoryRecord {
  */
 export const HISTORY_RETENTION_LIMIT = 200
 
+/**
+ * Why a store operation could not be served.
+ *
+ * `not-configured` is the absent, blank, or unparsable `MONGODB_URI`
+ * (Requirements 1.3, 1.10); `unreachable` is no answer inside the 5-second bound
+ * or no connection yet (Requirements 1.5, 1.11); `rejected` is a database that
+ * answered with an error.
+ */
+export type StoreFailureReason = "not-configured" | "unreachable" | "rejected"
+
+/** A store operation that was not served. The collection is unchanged. */
+export interface StoreFailure {
+  readonly reason: StoreFailureReason
+  /**
+   * A fixed sentence from `src/domain/storeMessages.ts`. Never a driver message,
+   * and never any part of the Mongo_Connection_URI (Requirement 1.6).
+   */
+  readonly message: string
+}
+
 /** Rejection codes carried by a failed {@link Envelope}. */
 export type AppErrorCode =
   | "VALIDATION"
@@ -161,6 +181,18 @@ export type AppErrorCode =
   | "NO_ENABLED_MEMBERS"
   | "RUN_IN_PROGRESS"
   | "FIXTURE_UNAVAILABLE"
+  /** No Mongo_Database is configured, or none is reachable (Requirements 1.3, 1.5, 1.10, 1.11). */
+  | "STORE_UNAVAILABLE"
+  /** A roster or Redemption_History read did not complete (Requirements 2.14, 3.10). */
+  | "STORE_READ_FAILED"
+  /** A Member_Registry write did not complete; the collection is unchanged (Requirement 2.8). */
+  | "STORE_WRITE_FAILED"
+  /** The request carries no valid User_Session (Requirement 6.5). */
+  | "NOT_AUTHENTICATED"
+  /** The signed-in account holds the Member_Role (Requirements 6.6, 6.7). */
+  | "NOT_AUTHORIZED"
+  /** The Account_Role of the bound User_Account could not be read (Requirement 6.15). */
+  | "AUTHORIZATION_UNKNOWN"
 
 /**
  * Discriminated result envelope returned by every server function instead of

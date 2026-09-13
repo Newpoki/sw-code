@@ -7,47 +7,46 @@
 //
 // Validates: Requirements 1.7, 6.5.
 //
-// ## Why this test does real file I/O
+// ## What "reloading the store" means now
 //
-// A round trip asserted against an injected flush would only prove that the
-// in-memory document survives a copy. Requirement 1.7 is about a restart, so
-// every sample here writes through the default `atomicFlush` into a `DATA_FILE`
-// inside a fresh `mkdtemp` directory, then builds a SECOND `JsonStore` over the
-// same path — the constructor load path is the restart. The repository's
-// `./data/store.json` is never touched: no test in this file uses the default
-// data file path, and every temporary directory is removed in a `finally`.
+// There is no `DATA_FILE` behind a request path any more. Requirement 1.7 of
+// `shared-coupon-redemption` is superseded by Requirements 2.3 and 3.6 of
+// `mongodb-google-auth-admin`: after a restart the Redemption_Server serves the
+// roster and the Redemption_History the collections hold, because neither store
+// module keeps state of its own. So the restart modelled here is a **second
+// store over the same collections** — write through the first, read through the
+// second — which is what `createInMemoryBackingStore` is for.
 //
-// ## Why the retention case is split off
+// That is a weaker claim than the old one and deliberately so. It shows the two
+// store modules hold nothing per instance, not that a deployment durably wrote
+// anything. The durability half belongs to a deployment and stays with
+// `tests/support/mongoFixture.ts` and `tests/integration/mongoBootstrap.test.ts`,
+// which skip when none is configured. Nothing about the round trip is asserted
+// against a serialized document, because the document a collection holds is not
+// a file this suite can read back.
 //
-// The retention rule of Requirement 6.5 only becomes observable past
-// `HISTORY_RETENTION_LIMIT` records, and every append is one real atomic write
-// (temp file, `fsync`, rename). Appending 200+ records at `numRuns: 100` would
-// mean tens of thousands of `fsync` calls and a suite that crawls. So the main
-// property runs at `numRuns: 100` over modest sizes (roster 0-8 entries,
-// history 0-5 records), and the over-the-limit case runs as a separate property
-// at a small `numRuns` where a few hundred writes per sample are affordable.
-// Together they cover both halves of the requirement.
-
-import { mkdtemp, readFile, rm } from "node:fs/promises"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
+// ## Why both halves now run at the full run count
+//
+// The retention half used to be pinned in `RUNS_BELOW_MINIMUM` at `numRuns: 3`,
+// because it crosses `HISTORY_RETENTION_LIMIT` records and every append was one
+// real atomic write — a temp file, an `fsync`, a rename — which measured at
+// roughly 850ms per sample. Over the in-memory store an append is a counter
+// bump, an insert, a count, and past the window a find and a delete, all against
+// arrays. The reason for the exception is gone, so the pin was deleted along
+// with it and both properties run at `numRuns: 100`.
 
 import fc from "fast-check"
-import { afterAll, describe, expect, it } from "vitest"
+import { describe, expect, it } from "vitest"
 
 import { MEMBER_OUTCOME_VALUES } from "@/domain/types"
-import {
-  createJsonStore,
-  serializeStoreDocument,
-  STORE_VERSION,
-} from "@/server/store/jsonStore.server"
 import { createMemberRegistryStore } from "@/server/store/memberRegistry.server"
+import type { MemberRegistryStore } from "@/server/store/memberRegistry.server"
 import {
   createHistoryStore,
   HISTORY_RETENTION_LIMIT,
   toHistoryOutcomeRows,
 } from "@/server/store/history.server"
-import type { JsonStore, StoreLogger } from "@/server/store/jsonStore.server"
+import type { HistoryStore } from "@/server/store/history.server"
 import type {
   MemberOutcome,
   MemberOutcomeValue,
@@ -55,6 +54,11 @@ import type {
   RedemptionHistoryRecord,
 } from "@/domain/types"
 
+import {
+  createInMemoryBackingStore,
+  createInMemoryMongoStore,
+} from "../support/inMemoryMongoStore"
+import type { InMemoryBackingStore } from "../support/inMemoryMongoStore"
 import {
   rosterArb,
   trimmedCouponCodeArb,
@@ -68,44 +72,48 @@ const RETENTION_FLOOR = 100
 /** Fixed base instant so generated `completedAt` values are deterministic. */
 const BASE_TIME = Date.parse("2025-01-04T18:00:00.000Z")
 
-/** The store logs warnings on a corrupt or unwritable file; none is expected. */
-const silentLogger: StoreLogger = { warn: () => undefined }
-
 /* -------------------------------------------------------------------------- */
-/* Temporary DATA_FILE handling                                               */
+/* The two stores over one set of collections                                  */
 /* -------------------------------------------------------------------------- */
 
-/** Directories still on disk, as a safety net if a sample throws mid-way. */
-const liveTempDirs = new Set<string>()
+interface Stores {
+  readonly registry: MemberRegistryStore
+  readonly history: HistoryStore
+  /** Everything this store logged; expected to stay empty. */
+  readonly warnings: readonly string[]
+}
 
-afterAll(async () => {
-  await Promise.all(
-    [...liveTempDirs].map((dir) => rm(dir, { recursive: true, force: true }))
-  )
-  liveTempDirs.clear()
-})
-
-/**
- * Runs `body` against a `DATA_FILE` inside a fresh temporary directory, then
- * removes that directory. The path is always `<mkdtemp>/store.json`, so nothing
- * outside the OS temporary directory is ever written.
- */
-async function withTempDataFile<T>(
-  body: (filePath: string) => Promise<T>
-): Promise<T> {
-  const dir = await mkdtemp(join(tmpdir(), "scr-round-trip-"))
-  liveTempDirs.add(dir)
-  try {
-    return await body(join(dir, "store.json"))
-  } finally {
-    liveTempDirs.delete(dir)
-    await rm(dir, { recursive: true, force: true })
+/** A Member_Registry and a Redemption_History over `backing`. */
+function storesOver(backing: InMemoryBackingStore): Stores {
+  const handle = createInMemoryMongoStore({ backing })
+  return {
+    registry: createMemberRegistryStore(handle.store),
+    history: createHistoryStore(handle.store, { logger: handle.logger }),
+    warnings: handle.warnings,
   }
 }
 
-/** A store over `filePath` using the real atomic flush. */
-function storeAt(filePath: string): JsonStore {
-  return createJsonStore({ dataFilePath: filePath, logger: silentLogger })
+/** The roster in position order, or a thrown explanation. */
+async function rosterOf(
+  registry: MemberRegistryStore
+): Promise<readonly MemberRegistryEntry[]> {
+  const listed = await registry.list()
+  if (listed.kind !== "entries") {
+    throw new Error(`the roster read reported "${listed.kind}"`)
+  }
+  return listed.entries
+}
+
+/** The retained records in read order, or a thrown explanation. */
+async function recordsOf(
+  history: HistoryStore,
+  limit?: number
+): Promise<readonly RedemptionHistoryRecord[]> {
+  const listed = await history.list(limit)
+  if (listed.kind !== "records") {
+    throw new Error(`the history read reported "${listed.kind}"`)
+  }
+  return listed.records
 }
 
 /* -------------------------------------------------------------------------- */
@@ -167,7 +175,7 @@ interface HistorySeed {
   /**
    * Seconds added to {@link BASE_TIME}. The narrow range deliberately produces
    * records sharing a `completedAt`, so the `seq` tie-break of Requirement 6.6
-   * has to survive the round trip too.
+   * has to survive the restart too.
    */
   readonly completedAtOffsetSeconds: number
   readonly mock: boolean
@@ -189,23 +197,19 @@ const historySeedArb: fc.Arbitrary<HistorySeed> = fc.record({
 
 /**
  * Adds every roster entry through the Member_Registry and appends every history
- * record through the Redemption_History, then waits for the flush chain to
- * drain, so the file on disk holds the final document.
+ * record through the Redemption_History.
  *
  * `add` always stores an enabled entry, so a disabled sample is followed by a
  * `setEnabled(false)`: that is the sequence a real roster goes through, and it
- * is what Requirement 1.7 has to preserve.
+ * is what the restart has to preserve.
  */
 async function applyMutations(
-  store: JsonStore,
+  stores: Stores,
   roster: readonly MemberRegistryEntry[],
   historySeeds: readonly HistorySeed[]
 ): Promise<void> {
-  const registry = createMemberRegistryStore(store)
-  const history = createHistoryStore(store)
-
   for (const entry of roster) {
-    const added = await registry.add({
+    const added = await stores.registry.add({
       memberLabel: entry.memberLabel,
       hiveId: entry.hiveId,
     })
@@ -213,13 +217,13 @@ async function applyMutations(
     // cap, so every add is expected to be accepted.
     expect(added.kind).toBe("added")
     if (added.kind === "added" && !entry.enabled) {
-      const updated = await registry.setEnabled(added.entry.id, false)
+      const updated = await stores.registry.setEnabled(added.entry.id, false)
       expect(updated.kind).toBe("updated")
     }
   }
 
   for (const [index, seed] of historySeeds.entries()) {
-    await history.append({
+    const appended = await stores.history.append({
       runId: `run-${index}`,
       couponCode: seed.couponCode,
       completedAt: new Date(
@@ -229,9 +233,8 @@ async function applyMutations(
       stoppedEarly: seed.stoppedEarly,
       outcomes: toHistoryOutcomeRows(toOutcomes(seed.outcomeSeeds)),
     })
+    expect(appended.kind).toBe("appended")
   }
-
-  await store.whenIdle()
 }
 
 /** The three fields Requirement 1.7 names, in roster order. */
@@ -254,180 +257,183 @@ function highestSeq(records: readonly RedemptionHistoryRecord[]): number {
 /* -------------------------------------------------------------------------- */
 
 describe("Property 14: persistence round trip", () => {
-  it("reloads the roster and the history from the written file unchanged", async () => {
+  it("reads the roster and the history back through a second store unchanged", async () => {
     await fc.assert(
       fc.asyncProperty(
         rosterArb({ maxLength: 8 }),
         fc.array(historySeedArb, { maxLength: 5 }),
         async (roster, historySeeds) => {
-          await withTempDataFile(async (filePath) => {
-            const written = storeAt(filePath)
-            await applyMutations(written, roster, historySeeds)
+          const backing = createInMemoryBackingStore()
+          const written = storesOver(backing)
+          await applyMutations(written, roster, historySeeds)
 
-            const before = written.read()
-            const mutationCount =
-              roster.length +
-              roster.filter((entry) => !entry.enabled).length +
-              historySeeds.length
+          const rosterBefore = await rosterOf(written.registry)
+          const recordsBefore = await recordsOf(written.history)
 
-            // The restart: a second store over the same path, loading the file
-            // the first one wrote.
-            const reloaded = storeAt(filePath)
-            const after = reloaded.read()
+          // The restart: a second store over the same collections, holding
+          // nothing of the first one's.
+          const reloaded = storesOver(backing)
+          const rosterAfter = await rosterOf(reloaded.registry)
+          const recordsAfter = await recordsOf(reloaded.history)
 
-            /* Requirement 1.7: same entries, same order, same fields. */
-            expect(after.members).toHaveLength(before.members.length)
-            expect(identityOf(after.members)).toEqual(
-              identityOf(before.members)
-            )
-            expect(identityOf(after.members)).toEqual(identityOf(roster))
-            expect(after.members).toEqual(before.members)
+          /* Requirement 1.7, as Requirement 2.3 restates it: same entries, same
+           * order, same fields. */
+          expect(rosterAfter).toHaveLength(rosterBefore.length)
+          expect(identityOf(rosterAfter)).toEqual(identityOf(rosterBefore))
+          expect(identityOf(rosterAfter)).toEqual(identityOf(roster))
+          expect(rosterAfter).toEqual(rosterBefore)
 
-            /* Requirement 6.5: the retained records survive as stored. */
-            expect(after.history).toEqual(before.history)
-            expect(after.history.map((record) => record.seq)).toEqual(
-              before.history.map((record) => record.seq)
-            )
-            expect(after.history.length).toBe(
-              Math.min(historySeeds.length, HISTORY_RETENTION_LIMIT)
-            )
+          /* Requirement 6.5, as Requirement 3.6 restates it: the retained
+           * records read back as stored, in the same Requirement 6.6 order. */
+          expect(recordsAfter).toEqual(recordsBefore)
+          expect(recordsAfter.map((record) => record.seq)).toEqual(
+            recordsBefore.map((record) => record.seq)
+          )
+          expect(recordsAfter).toHaveLength(
+            Math.min(historySeeds.length, HISTORY_RETENTION_LIMIT)
+          )
 
-            /* The document itself round-trips field for field. */
-            expect(after.version).toBe(STORE_VERSION)
-            expect(after.version).toBe(before.version)
-            expect(after.nextHistorySeq).toBe(before.nextHistorySeq)
-            expect(serializeStoreDocument(after)).toBe(
-              serializeStoreDocument(before)
-            )
+          /* And the collections themselves hold exactly that many documents, so
+           * the agreement above is not two stores sharing one wrong answer. */
+          expect(backing.members()).toHaveLength(roster.length)
+          expect(backing.history()).toHaveLength(historySeeds.length)
 
-            // The bytes on disk are exactly the serialized document. Skipped
-            // when nothing was mutated, because then no flush ever ran and the
-            // file does not exist — an absent DATA_FILE is an empty store.
-            if (mutationCount > 0) {
-              expect(await readFile(filePath, "utf8")).toBe(
-                serializeStoreDocument(before)
-              )
-            } else {
-              expect(after.members).toHaveLength(0)
-              expect(after.history).toHaveLength(0)
-            }
-
-            /* The Requirement 6.6 read order survives too. */
-            const reloadedHistory = createHistoryStore(reloaded)
-            expect(reloadedHistory.list()).toEqual(
-              createHistoryStore(written).list()
-            )
-
-            /*
-             * `nextHistorySeq` keeps climbing after the restart. The retained
-             * records are snapshotted first: `read()` hands back the live
-             * document, so the append below would otherwise show up inside the
-             * very array the new `seq` is compared against.
-             */
-            const retained = [...after.history]
-            const ceiling = highestSeq(retained)
-            const appended = await reloadedHistory.append({
-              runId: "run-after-reload",
-              couponCode: "AFTER-RELOAD",
-              completedAt: new Date(BASE_TIME + 60_000).toISOString(),
-              mock: false,
-              stoppedEarly: false,
-              outcomes: [],
-            })
-            expect(appended.record.seq).toBeGreaterThan(ceiling)
-            for (const record of retained) {
-              expect(appended.record.seq).toBeGreaterThan(record.seq)
-            }
-            await reloaded.whenIdle()
+          /*
+           * The append counter keeps climbing across the restart: it lives in
+           * the `counters` collection rather than being rebuilt from the
+           * records, so the second store hands out a `seq` above every retained
+           * one (Requirement 3.2).
+           */
+          const ceiling = highestSeq(recordsAfter)
+          const appended = await reloaded.history.append({
+            runId: "run-after-reload",
+            couponCode: "AFTER-RELOAD",
+            completedAt: new Date(BASE_TIME + 60_000).toISOString(),
+            mock: false,
+            stoppedEarly: false,
+            outcomes: [],
           })
+          expect(appended.kind).toBe("appended")
+          if (appended.kind !== "appended") return
+          expect(appended.record.seq).toBeGreaterThan(ceiling)
+          for (const record of recordsAfter) {
+            expect(appended.record.seq).toBeGreaterThan(record.seq)
+          }
+
+          /* The same holds for the roster counter: a new entry takes a position
+           * above every existing one (Requirement 2.1). */
+          if (roster.length < 100) {
+            const added = await reloaded.registry.add({
+              memberLabel: "After the reload",
+              hiveId: "hive-after-reload",
+            })
+            expect(added.kind).toBe("added")
+            expect((await rosterOf(reloaded.registry)).at(-1)?.hiveId).toBe(
+              "hive-after-reload"
+            )
+          }
+
+          expect(written.warnings).toEqual([])
+          expect(reloaded.warnings).toEqual([])
         }
       ),
       { numRuns: 100 }
     )
   })
 
-  // Split off from the property above on purpose: each append is a real atomic
-  // write, so 200+ of them per sample only stays affordable at a small numRuns.
   it("keeps the newest retained records when the history exceeds the limit", async () => {
     await fc.assert(
       fc.asyncProperty(fc.integer({ min: 1, max: 6 }), async (overflow) => {
         const total = HISTORY_RETENTION_LIMIT + overflow
 
-        await withTempDataFile(async (filePath) => {
-          const written = storeAt(filePath)
-          const history = createHistoryStore(written)
+        const backing = createInMemoryBackingStore()
+        const written = storesOver(backing)
 
-          for (let index = 0; index < total; index += 1) {
-            await history.append({
-              runId: `run-${index}`,
-              couponCode: `COUPON-${index}`,
-              completedAt: new Date(BASE_TIME + index * 1000).toISOString(),
-              mock: index % 2 === 0,
-              stoppedEarly: false,
-              outcomes: toHistoryOutcomeRows([
-                {
-                  hiveId: `hive-${index}`,
-                  memberLabel: `Member ${index}`,
-                  position: 0,
+        for (let index = 0; index < total; index += 1) {
+          const appended = await written.history.append({
+            runId: `run-${index}`,
+            couponCode: `COUPON-${index}`,
+            completedAt: new Date(BASE_TIME + index * 1000).toISOString(),
+            mock: index % 2 === 0,
+            stoppedEarly: false,
+            outcomes: toHistoryOutcomeRows([
+              {
+                hiveId: `hive-${index}`,
+                memberLabel: `Member ${index}`,
+                position: 0,
+                outcome: "SUCCESS",
+                upstreamResult: {
+                  responseCode: "100",
+                  responseMessage: "The coupon gift has been sent.",
                   outcome: "SUCCESS",
-                  upstreamResult: {
-                    responseCode: "100",
-                    responseMessage: "The coupon gift has been sent.",
-                    outcome: "SUCCESS",
-                  },
                 },
-              ]),
-            })
-          }
-          await written.whenIdle()
+              },
+            ]),
+          })
+          expect(appended.kind).toBe("appended")
+        }
 
-          const before = written.read()
-          const after = storeAt(filePath).read()
+        const before = await recordsOf(written.history)
+        const reloaded = storesOver(backing)
+        const after = await recordsOf(reloaded.history)
 
-          /* Requirement 6.5: the retained window survives the restart. */
-          expect(after.history).toEqual(before.history)
-          expect(after.history).toHaveLength(HISTORY_RETENTION_LIMIT)
+        /* Requirement 6.5: the retained window survives the restart. */
+        expect(after).toEqual(before)
+        expect(after).toHaveLength(HISTORY_RETENTION_LIMIT)
+        expect(backing.history()).toHaveLength(HISTORY_RETENTION_LIMIT)
 
-          // `seq` starts at 1, so the newest 200 carry
-          // `total - 199 .. total`, in append order.
-          const seqs = after.history.map((record) => record.seq)
-          expect(seqs).toEqual(
-            Array.from(
-              { length: HISTORY_RETENTION_LIMIT },
-              (_, offset) => total - HISTORY_RETENTION_LIMIT + 1 + offset
-            )
+        // `seq` starts at 1, so the newest 200 carry `total - 199 .. total`,
+        // newest first in the read order.
+        const seqs = after.map((record) => record.seq)
+        expect(seqs).toEqual(
+          Array.from(
+            { length: HISTORY_RETENTION_LIMIT },
+            (_, offset) => total - offset
           )
+        )
 
-          // The literal requirement: at least the 100 most recent survive.
-          const retained = new Set(seqs)
-          for (let seq = total - RETENTION_FLOOR + 1; seq <= total; seq += 1) {
-            expect(retained.has(seq)).toBe(true)
-          }
+        // The literal requirement: at least the 100 most recent survive.
+        const retained = new Set(seqs)
+        for (let seq = total - RETENTION_FLOOR + 1; seq <= total; seq += 1) {
+          expect(retained.has(seq)).toBe(true)
+        }
 
-          // Coupon_Code, completion timestamp, and outcome rows unchanged.
-          const newest = after.history[after.history.length - 1]
-          expect(newest.couponCode).toBe(`COUPON-${total - 1}`)
-          expect(newest.completedAt).toBe(
-            new Date(BASE_TIME + (total - 1) * 1000).toISOString()
-          )
-          expect(newest.outcomes).toEqual([
-            {
-              hiveId: `hive-${total - 1}`,
-              memberLabel: `Member ${total - 1}`,
-              outcome: "SUCCESS",
-              responseCode: "100",
-              responseMessage: "The coupon gift has been sent.",
-            },
-          ])
+        // Coupon_Code, completion timestamp, and outcome rows unchanged.
+        const newest = after[0]
+        expect(newest.seq).toBe(total)
+        expect(newest.couponCode).toBe(`COUPON-${total - 1}`)
+        expect(newest.completedAt).toBe(
+          new Date(BASE_TIME + (total - 1) * 1000).toISOString()
+        )
+        expect(newest.outcomes).toEqual([
+          {
+            hiveId: `hive-${total - 1}`,
+            memberLabel: `Member ${total - 1}`,
+            outcome: "SUCCESS",
+            responseCode: "100",
+            responseMessage: "The coupon gift has been sent.",
+          },
+        ])
 
-          /* The counter never resets, even though the trim dropped records. */
-          expect(after.nextHistorySeq).toBe(before.nextHistorySeq)
-          expect(after.nextHistorySeq).toBeGreaterThan(
-            highestSeq(after.history)
-          )
+        /* The counter never resets, even though the trim dropped the records
+         * holding the lowest values, and the second store reads the same one. */
+        const appended = await reloaded.history.append({
+          runId: "run-after-trim",
+          couponCode: "COUPON-AFTER-TRIM",
+          completedAt: new Date(BASE_TIME + total * 1000).toISOString(),
+          mock: false,
+          stoppedEarly: false,
+          outcomes: [],
         })
+        expect(appended.kind).toBe("appended")
+        if (appended.kind !== "appended") return
+        expect(appended.record.seq).toBe(total + 1)
+        expect(backing.history()).toHaveLength(HISTORY_RETENTION_LIMIT)
+
+        expect(written.warnings).toEqual([])
+        expect(reloaded.warnings).toEqual([])
       }),
-      { numRuns: 3 }
+      { numRuns: 100 }
     )
   })
 })

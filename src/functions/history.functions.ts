@@ -46,12 +46,23 @@
  *
  * Neither function writes anything, so no envelope returned here ever carries a
  * warning.
+ *
+ * ## A read that did not complete
+ *
+ * Both store reads are round trips to a deployment that may not answer, so both
+ * carry a `failed` variant. It is mapped through {@link storeFailureEnvelope}:
+ * `STORE_UNAVAILABLE` when no operation was served, otherwise
+ * `STORE_READ_FAILED`, and in both cases the store's own fixed sentence and zero
+ * records (Requirement 3.10). This module composes no sentence of its own and
+ * never sees a driver error. `not-found` is not a failure — it is a successful
+ * read of null, with zero error messages (Requirement 3.5).
  */
 
 import { createServerFn } from "@tanstack/react-start"
 import { z } from "zod"
 
 import { couponCodeSchema, firstErrorMessage } from "@/domain/schemas"
+import { storeFailureEnvelope } from "@/domain/storeFailures"
 import { HISTORY_RETENTION_LIMIT } from "@/domain/types"
 import { getHistoryStore } from "@/server/store/history.server"
 import type { Validated } from "@/functions/members.functions"
@@ -123,7 +134,11 @@ function read<T>(data: T): Envelope<T> {
   return { ok: true, data, warnings: [] }
 }
 
-/** A rejection envelope. Only validation can reject a read. */
+/**
+ * A validation rejection envelope. The other way a read is rejected is a store
+ * failure, which {@link storeFailureEnvelope} builds from the store's own
+ * sentence (Requirement 3.10).
+ */
 function rejected<T>(message: string): Envelope<T> {
   return { ok: false, error: { code: "VALIDATION", message } }
 }
@@ -169,12 +184,19 @@ export function validateFindLatestRunInput(
  * Exported separately from the server function, taking the store as a
  * parameter, because `createServerFn(...).handler(fn)` cannot be invoked
  * directly in a unit test.
+ *
+ * A read is a round trip to a deployment that may not answer, so it can fail: a
+ * `failed` result becomes a rejection carrying the store's own sentence and no
+ * records at all, not even partially read ones (Requirement 3.10).
  */
-export function readHistory(
+export async function readHistory(
   store: HistoryStore,
   input: ListHistoryInput = {}
-): Envelope<RedemptionHistoryRecord[]> {
-  return read(store.list(input.limit))
+): Promise<Envelope<RedemptionHistoryRecord[]>> {
+  const result = await store.list(input.limit)
+  return result.kind === "records"
+    ? read([...result.records])
+    : storeFailureEnvelope(result.failure, "read")
 }
 
 /**
@@ -186,11 +208,20 @@ export function readHistory(
  * the dialog cannot announce a "last used" timestamp for a code that was never
  * redeemed.
  */
-export function readLatestRunForCoupon(
+export async function readLatestRunForCoupon(
   store: HistoryStore,
   input: FindLatestRunInput
-): Envelope<RedemptionHistoryRecord | null> {
-  return read(store.findLatestByCouponCode(input.couponCode))
+): Promise<Envelope<RedemptionHistoryRecord | null>> {
+  const result = await store.findLatestByCouponCode(input.couponCode)
+  switch (result.kind) {
+    case "record":
+      return read(result.record)
+    case "not-found":
+      /* An answer, not a failure: Requirement 3.5 asks for zero error messages. */
+      return read(null)
+    case "failed":
+      return storeFailureEnvelope(result.failure, "read")
+  }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -206,7 +237,7 @@ export function readLatestRunForCoupon(
  */
 export const listHistory = createServerFn()
   .validator(validateListHistoryInput)
-  .handler(({ data }) =>
+  .handler(async ({ data }) =>
     data.ok
       ? readHistory(getHistoryStore(), data.value)
       : rejected<RedemptionHistoryRecord[]>(data.message)
@@ -219,7 +250,7 @@ export const listHistory = createServerFn()
  */
 export const findLatestRunForCoupon = createServerFn()
   .validator(validateFindLatestRunInput)
-  .handler(({ data }) =>
+  .handler(async ({ data }) =>
     data.ok
       ? readLatestRunForCoupon(getHistoryStore(), data.value)
       : rejected<RedemptionHistoryRecord | null>(data.message)

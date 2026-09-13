@@ -40,10 +40,6 @@
  * Validates: Requirements 3.1, 5.6, 5.8, 6.3
  */
 
-import { randomUUID } from "node:crypto"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
-
 import fc from "fast-check"
 import { describe, expect, it } from "vitest"
 
@@ -62,9 +58,9 @@ import {
 } from "@/server/run/coordinator.server"
 import { createHistoryStore } from "@/server/store/history.server"
 import type { HistoryStore } from "@/server/store/history.server"
-import { createJsonStore } from "@/server/store/jsonStore.server"
 import { createMemberRegistryStore } from "@/server/store/memberRegistry.server"
 
+import { createInMemoryMongoStore } from "../support/inMemoryMongoStore"
 import { StubUpstreamClient, throwOnCall } from "../support/stubUpstreamClient"
 import type { StubScriptEntry } from "../support/stubUpstreamClient"
 import {
@@ -170,15 +166,11 @@ async function createHarness(
   roster: readonly MemberRegistryEntry[],
   steps: readonly StubStep[]
 ): Promise<Harness> {
-  const store = createJsonStore({
-    dataFilePath: join(
-      tmpdir(),
-      `scr-outcome-count-${randomUUID()}`,
-      "store.json"
-    ),
-    flush: () => Promise.resolve(),
-    logger: { warn: () => undefined },
-  })
+  const handle = createInMemoryMongoStore()
+  /* The in-memory Mongo_Store of `tests/support/inMemoryMongoStore.ts`: no
+   * deployment and no file, and every operation served, so a `failed` result
+   * anywhere below is a genuine falsification. */
+  const store = handle.store
 
   let nextId = 0
   const registry = createMemberRegistryStore(store, {
@@ -418,7 +410,8 @@ describe("Redemption_Run outcome-count invariant", () => {
           expect(rejection.code).toBe("NO_ENABLED_MEMBERS")
           expect(events).toEqual([])
           expect(harness.upstream.requests).toEqual([])
-          expect(harness.history.list()).toEqual([])
+          const stored = await harness.history.list()
+          expect(stored.kind === "records" ? stored.records : null).toEqual([])
           return
         }
 

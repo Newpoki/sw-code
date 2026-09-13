@@ -7,12 +7,18 @@
  * renders one component with plain props: no router, no query client, no server.
  *
  * The message helpers are imported from the modules that own them —
- * `PERSISTENCE_WARNING` from the server function layer,
- * `duplicateHiveIdMessage`/`rosterFullMessage` from the store, and
+ * `duplicateHiveIdMessage`/`rosterFullMessage` from the store and
  * `lengthRangeMessage` from the shared schemas — so a test asserts the exact
  * sentence the application produces rather than a paraphrase that could drift.
  * The two `.server` modules only reach for `zod`, `node:crypto`, and `node:fs`
  * at module scope, all of which resolve in the jsdom project.
+ *
+ * The roster write path no longer carries a persistence warning of its own —
+ * task 12.1 deleted `PERSISTENCE_WARNING` when Requirement 2.8 turned a failed
+ * write into a rejection. `RosterTable` and `AddMemberForm` still render any
+ * `warningMessage` prop they are handed, though, so the two cases that exercise
+ * that rendering path feed it a plain fixture string ({@link WARNING_FIXTURE})
+ * rather than sourcing it from a constant that no longer exists.
  *
  * `jest-dom` is not installed, so assertions are plain DOM reads: attribute
  * values, `value`, `textContent`, and `queryBy* === null`.
@@ -33,13 +39,20 @@ import {
   MEMBER_LABEL_MAX_LENGTH,
   lengthRangeMessage,
 } from "@/domain/schemas"
-import { PERSISTENCE_WARNING } from "@/functions/members.functions"
 import {
   duplicateHiveIdMessage,
   rosterFullMessage,
 } from "@/server/store/memberRegistry.server"
 import type { AddMemberFormProps } from "@/components/AddMemberForm"
 import type { MemberRegistryEntry } from "@/domain/types"
+
+/**
+ * A stand-in warning string for the two cases that prove `RosterTable` and
+ * `AddMemberForm` render whatever `warningMessage` they are handed. The roster
+ * write path produces no warning of its own any more (task 12.1), so the string
+ * is a local fixture rather than an application constant.
+ */
+const WARNING_FIXTURE = "A stand-in warning the component is asked to display."
 
 function entry(
   overrides: Partial<MemberRegistryEntry> & Pick<MemberRegistryEntry, "id">
@@ -155,17 +168,17 @@ describe("RosterTable", () => {
     expect(onRemove.mock.calls).toEqual([["m1"]])
   })
 
-  it("displays the persistence warning it is given", () => {
+  it("displays the warning it is given", () => {
     render(
       <RosterTable
         entries={INSERTION_ORDER}
         onSetEnabled={vi.fn()}
         onRemove={vi.fn()}
-        warningMessage={PERSISTENCE_WARNING}
+        warningMessage={WARNING_FIXTURE}
       />
     )
 
-    expect(screen.getByText(PERSISTENCE_WARNING)).toBeTruthy()
+    expect(screen.getByText(WARNING_FIXTURE)).toBeTruthy()
   })
 })
 
@@ -263,9 +276,9 @@ describe("AddMemberForm", () => {
     expect(form.hiveId.getAttribute("aria-invalid")).toBe("false")
   })
 
-  it("displays the persistence warning it is given", () => {
-    renderForm({ warningMessage: PERSISTENCE_WARNING })
+  it("displays the warning it is given", () => {
+    renderForm({ warningMessage: WARNING_FIXTURE })
 
-    expect(screen.getByText(PERSISTENCE_WARNING)).toBeTruthy()
+    expect(screen.getByText(WARNING_FIXTURE)).toBeTruthy()
   })
 })

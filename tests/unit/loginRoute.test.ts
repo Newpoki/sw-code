@@ -95,6 +95,7 @@ async function view(url: string): Promise<{
   passphraseRequired: boolean
   error: string | null
   notice: string | null
+  needs: "passphrase" | "passphrase-and-sign-in"
 }> {
   const handler = handlersOf(LoginRoute.options).GET
   expect(handler).toBeTypeOf("function")
@@ -188,7 +189,24 @@ describe("/login GET", () => {
       passphraseRequired: true,
       error: null,
       notice: null,
+      needs: "passphrase-and-sign-in",
     })
+  })
+
+  it("tailors the sign-in copy to a member's needs", async () => {
+    installAuth(PASSPHRASE)
+
+    expect(
+      (await view("http://localhost:3000/login?needs=passphrase")).needs
+    ).toBe("passphrase")
+  })
+
+  it("falls back to the safe superset for an unrecognized needs value", async () => {
+    installAuth(PASSPHRASE)
+
+    expect(
+      (await view("http://localhost:3000/login?needs=%3Cscript%3E")).needs
+    ).toBe("passphrase-and-sign-in")
   })
 
   it("ignores an unrecognized error code instead of rendering it", async () => {
@@ -208,6 +226,7 @@ describe("/login GET", () => {
       passphraseRequired: false,
       error: null,
       notice: GATE_DISABLED_MESSAGE,
+      needs: "passphrase-and-sign-in",
     })
   })
 })

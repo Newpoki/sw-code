@@ -26,9 +26,11 @@
  *    wrapped in counting proxies and the counters are asserted to be zero after
  *    the gate has run. The structural argument is stronger than the counters:
  *    {@link evaluateGate} takes only an {@link Auth}, a pathname, a handler type,
- *    and a cookie string, so it has no store to read. The counters back that up,
- *    and a liveness check at the end of the property proves they would have moved
- *    had anything touched the seams.
+ *    a cookie string, a handshake fact, and an injected authorization resolver,
+ *    so it has no store to read of its own. The resolver these properties inject
+ *    reports `anonymous` without touching the counting-proxy store, so the
+ *    counters stay at zero; a liveness check at the end proves they would have
+ *    moved had anything touched the seams.
  * 3. **Nothing is run.** Same shape: a counting {@link RunCoordinator} whose
  *    `start` is asserted never to have been called.
  *
@@ -47,10 +49,6 @@
  * injected through {@link createAuth}, and the store writes to a temporary path
  * with the filesystem flush replaced, so nothing is written.
  */
-
-import { randomUUID } from "node:crypto"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 
 import fc from "fast-check"
 import { describe, expect, it } from "vitest"
@@ -72,21 +70,28 @@ import {
   SESSION_REQUIRED_CODE,
   SESSION_REQUIRED_REDIRECT_STATUS,
   SESSION_REQUIRED_STATUS,
+  SIGN_IN_PATH,
   evaluateGate,
   gateRejectionResponse,
   isGateExemptPath,
 } from "@/server/gate.server"
 import { createHistoryStore } from "@/server/store/history.server"
-import { createJsonStore } from "@/server/store/jsonStore.server"
 import { createMemberRegistryStore } from "@/server/store/memberRegistry.server"
 
 import type { Auth, SessionPayload } from "@/server/auth.server"
-import type { GateHandlerType, GateRejection } from "@/server/gate.server"
+import type { AuthorizationDecision } from "@/server/authorization.server"
+import type {
+  GateDecision,
+  GateHandlerType,
+  GateInput,
+  GateRejection,
+} from "@/server/gate.server"
 import type { RunCoordinator } from "@/server/run/coordinator.server"
 import type { HistoryStore } from "@/server/store/history.server"
 import type { MemberRegistryStore } from "@/server/store/memberRegistry.server"
 import type { MemberRegistryEntry, RunEvent } from "@/domain/types"
 
+import { createInMemoryMongoStore } from "../support/inMemoryMongoStore"
 import { rosterArb, trimmedCouponCodeArb } from "./generators"
 
 /* -------------------------------------------------------------------------- */
@@ -393,6 +398,34 @@ const ALL_REJECT_REASONS: readonly GateRejection["reason"][] = [
   "revoked",
 ]
 
+/**
+ * The gate's second dimension, held fixed for this Requirement 8 suite: no Clerk
+ * handshake, and an authorization resolver that reports `anonymous` (no Clerk
+ * session). Under these facts the gate reduces to the Passphrase_Session rule
+ * this suite verifies — a request with no valid Passphrase_Session is rejected,
+ * and the injected resolver touches none of the counting-proxy store, so the
+ * "no store read" claim is preserved.
+ */
+const NO_CLERK_SESSION: Pick<
+  GateInput,
+  "clerkHandshake" | "resolveAuthorization"
+> = {
+  clerkHandshake: false,
+  resolveAuthorization: (): Promise<AuthorizationDecision> =>
+    Promise.resolve({ kind: "anonymous" }),
+}
+
+/**
+ * Evaluates the gate over the passphrase-only facts this suite fixes, awaiting
+ * the now-async decision. A thin wrapper so each property reads as it did before
+ * the gate gained its second dimension.
+ */
+function evaluatePassphraseGate(
+  facts: Omit<GateInput, "clerkHandshake" | "resolveAuthorization">
+): Promise<GateDecision> {
+  return evaluateGate({ ...facts, ...NO_CLERK_SESSION })
+}
+
 /** One generated way of failing to carry a valid Session. */
 interface CookieVariant {
   /** Names the variant in a failure message. */
@@ -414,6 +447,13 @@ function assertFixedRejectionContent(
 ): void {
   expect(rejection.message).toBe(SESSION_REQUIRED_MESSAGE)
   expect(rejection.loginPath).toBe(LOGIN_PATH)
+  expect(rejection.signInPath).toBe(SIGN_IN_PATH)
+  /*
+   * Every rejection in this Requirement 8 suite is reached with no Clerk
+   * session, so authorization resolves to `anonymous` and the sender is directed
+   * to both submit the passphrase and sign in.
+   */
+  expect(rejection.needs).toBe("passphrase-and-sign-in")
 
   if (handlerType === "serverFn") {
     expect(rejection.status).toBe(SESSION_REQUIRED_STATUS)
@@ -422,6 +462,8 @@ function assertFixedRejectionContent(
       error: SESSION_REQUIRED_CODE,
       message: SESSION_REQUIRED_MESSAGE,
       loginPath: LOGIN_PATH,
+      signInPath: SIGN_IN_PATH,
+      needs: "passphrase-and-sign-in",
     })
     return
   }
@@ -435,12 +477,12 @@ function assertFixedRejectionContent(
  * Evaluates the gate for one variant and asserts the refusal
  * (Requirements 8.2, 8.3, 8.10).
  */
-function assertRejected(
+async function assertRejected(
   harness: GateHarness,
   request: RequestFacts,
   variant: CookieVariant
-): GateRejection {
-  const decision = evaluateGate({
+): Promise<GateRejection> {
+  const decision = await evaluatePassphraseGate({
     auth: harness.auth,
     pathname: request.pathname,
     handlerType: request.handlerType,
@@ -603,9 +645,7 @@ async function seedStore(
   couponCode: string
 ): Promise<SeededStore> {
   const warnings: Array<string> = []
-  const store = createJsonStore({
-    dataFilePath: join(tmpdir(), `scr-gate-${randomUUID()}`, "store.json"),
-    flush: () => Promise.resolve(),
+  const handle = createInMemoryMongoStore({
     logger: {
       warn: (message) => {
         warnings.push(message)
@@ -615,7 +655,7 @@ async function seedStore(
 
   let memberNumber = 0
   let clock = Date.parse("2025-01-05T09:00:00.000Z")
-  const registry = createMemberRegistryStore(store, {
+  const registry = createMemberRegistryStore(handle.store, {
     generateId: () => {
       memberNumber += 1
       return `leak-canary-member-id-${memberNumber}`
@@ -625,7 +665,7 @@ async function seedStore(
       return new Date(clock)
     },
   })
-  const history = createHistoryStore(store)
+  const history = createHistoryStore(handle.store)
 
   const stored: Array<MemberRegistryEntry> = []
   const submissions: Array<RosterSeed> = [
@@ -653,6 +693,9 @@ async function seedStore(
       responseMessage: "leak-canary-response-message",
     })),
   })
+  if (appended.kind !== "appended") {
+    throw new Error(`could not seed the history: ${appended.kind}`)
+  }
 
   expect(warnings).toEqual([])
 
@@ -743,9 +786,9 @@ describe("Access_Gate without a valid Session", () => {
   // granted exactly when that value is character-for-character identical to the
   // Shared_Passphrase and the sender is not throttled.
   // Validates: Requirements 8.2, 8.3, 8.4, 8.10
-  it("admits a request only when it carries a valid Session", () => {
-    fc.assert(
-      fc.property(
+  it("admits a request only when it carries a valid Session", async () => {
+    await fc.assert(
+      fc.asyncProperty(
         distinctivePassphraseArb,
         senderArb,
         requestArb,
@@ -753,7 +796,7 @@ describe("Access_Gate without a valid Session", () => {
         garbageTokenArb,
         fc.nat(),
         fc.nat(),
-        (
+        async (
           passphrase,
           sender,
           request,
@@ -767,7 +810,7 @@ describe("Access_Gate without a valid Session", () => {
 
           // Requirement 8.2: the granted Session is admitted.
           expect(
-            evaluateGate({
+            await evaluatePassphraseGate({
               auth: harness.auth,
               pathname: request.pathname,
               handlerType: request.handlerType,
@@ -833,14 +876,14 @@ describe("Access_Gate without a valid Session", () => {
           ]
 
           for (const variant of variants) {
-            assertRejected(harness, request, variant)
+            await assertRejected(harness, request, variant)
           }
 
           // Requirement 8.7 read through this property: an ended Session is no
           // longer a valid Session, so the gate refuses it too.
           const ended = grantSession(harness, `${sender}-ended`)
           harness.auth.logout(sessionCookieHeader(ended.token))
-          assertRejected(harness, request, {
+          await assertRejected(harness, request, {
             label: "an ended Session",
             header: sessionCookieHeader(ended.token),
             reasons: ["revoked"],
@@ -849,7 +892,7 @@ describe("Access_Gate without a valid Session", () => {
           // An expired token: the injected clock moves past `expiresAt`.
           const expiring = grantSession(harness, `${sender}-expiring`)
           harness.advance(SESSION_TTL_MS + 1)
-          assertRejected(harness, request, {
+          await assertRejected(harness, request, {
             label: "an expired Session",
             header: sessionCookieHeader(expiring.token),
             reasons: ["expired"],
@@ -857,7 +900,7 @@ describe("Access_Gate without a valid Session", () => {
 
           // The clock moved, so the token that was admitted above is now refused
           // as well: admission tracked the Session, not the request.
-          assertRejected(harness, request, {
+          await assertRejected(harness, request, {
             label: "the first Session after it expired",
             header: sessionCookieHeader(granted.token),
             reasons: ["expired"],
@@ -904,7 +947,7 @@ describe("Access_Gate without a valid Session", () => {
           ]
 
           for (const header of headers) {
-            const rejection = assertRejected(harness, request, {
+            const rejection = await assertRejected(harness, request, {
               label: `the cookie header ${JSON.stringify(header)}`,
               header,
               reasons: ALL_REJECT_REASONS,
@@ -920,9 +963,10 @@ describe("Access_Gate without a valid Session", () => {
 
           // Requirement 8.3: nothing was read and nothing was started. The
           // structural argument is stronger — `evaluateGate` receives only the
-          // Access_Gate seam, a pathname, a handler type, and a cookie string, so
-          // it holds no store and no coordinator to reach for — and these
-          // counters are what back it up.
+          // Access_Gate seam, a pathname, a handler type, a cookie string, and an
+          // injected resolver that here reports `anonymous` without touching the
+          // store, so it holds no store and no coordinator to reach for — and
+          // these counters are what back it up.
           expect(seeded.counters).toEqual({
             registryReads: 0,
             historyReads: 0,
@@ -932,8 +976,14 @@ describe("Access_Gate without a valid Session", () => {
           // The counters are live: the same seams do report a read and a run
           // start when something actually touches them, so the zeroes above are
           // an observation rather than a dead assertion.
-          expect(seeded.registry.list().length).toBeGreaterThan(0)
-          expect(seeded.history.list().length).toBeGreaterThan(0)
+          const liveRoster = await seeded.registry.list()
+          const liveHistory = await seeded.history.list()
+          expect(
+            liveRoster.kind === "entries" && liveRoster.entries.length
+          ).toBeGreaterThan(0)
+          expect(
+            liveHistory.kind === "records" && liveHistory.records.length
+          ).toBeGreaterThan(0)
           void seeded.coordinator.start(couponCode)
           expect(seeded.counters).toEqual({
             registryReads: 1,
@@ -948,15 +998,15 @@ describe("Access_Gate without a valid Session", () => {
 
   // Property 24, the login-comparison half.
   // Validates: Requirements 8.4, 8.10
-  it("grants a Session for the exact Shared_Passphrase and for no near miss", () => {
-    fc.assert(
-      fc.property(
+  it("grants a Session for the exact Shared_Passphrase and for no near miss", async () => {
+    await fc.assert(
+      fc.asyncProperty(
         passphraseArb,
         senderArb,
         requestArb,
         requestArb,
         fc.nat(),
-        (passphrase, sender, first, second, seed) => {
+        async (passphrase, sender, first, second, seed) => {
           const harness = createHarness({ passphrase })
           const granted = grantSession(harness, sender)
           const header = sessionCookieHeader(granted.token)
@@ -964,7 +1014,7 @@ describe("Access_Gate without a valid Session", () => {
           // Requirement 8.4: the granted Session admits every subsequent request.
           for (const request of [first, second]) {
             expect(
-              evaluateGate({
+              await evaluatePassphraseGate({
                 auth: harness.auth,
                 pathname: request.pathname,
                 handlerType: request.handlerType,
@@ -997,7 +1047,7 @@ describe("Access_Gate without a valid Session", () => {
           // No near miss granted a Session, and none invalidated the one the
           // exact value granted.
           expect(
-            evaluateGate({
+            await evaluatePassphraseGate({
               auth: harness.auth,
               pathname: first.pathname,
               handlerType: first.handlerType,
@@ -1028,17 +1078,17 @@ describe("Access_Gate without a valid Session", () => {
 
   // Property 24's complement: the gate is off when nothing is configured.
   // Validates: Requirement 8.9
-  it("admits every request when no Shared_Passphrase is configured", () => {
-    fc.assert(
-      fc.property(
+  it("admits every request when no Shared_Passphrase is configured", async () => {
+    await fc.assert(
+      fc.asyncProperty(
         anyPathnameArb,
         handlerTypeArb,
         anyCookieHeaderArb,
-        (pathname, handlerType, cookieHeader) => {
+        async (pathname, handlerType, cookieHeader) => {
           const harness = createHarness({ passphrase: null })
 
           expect(
-            evaluateGate({
+            await evaluatePassphraseGate({
               auth: harness.auth,
               pathname,
               handlerType,

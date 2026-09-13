@@ -1,43 +1,108 @@
 import { describe, expect, it } from "vitest"
 import {
+  ADMIN_EMAILS_ENV_VAR,
+  CLERK_PUBLISHABLE_KEY_ENV_VAR,
+  CLERK_SECRET_KEY_ENV_VAR,
   DEFAULT_DATA_FILE,
   DEFAULT_UPSTREAM_BASE_URL,
+  EMPTY_ADMIN_ALLOWLIST_WARNING,
   MOCK_MODE_ENV_VAR,
+  MONGODB_URI_ENV_VAR,
+  NO_MONGODB_URI_WARNING,
   NO_PASSPHRASE_WARNING,
+  UNPARSABLE_MONGODB_URI_WARNING,
+  missingClerkKeysWarning,
   resolveConfig,
   toClientConfig,
 } from "@/server/config.server"
-import type { ConfigLogger, EnvRecord } from "@/server/config.server"
+import type {
+  ConfigLogger,
+  EnvRecord,
+  ResolvedConfig,
+} from "@/server/config.server"
 
 /**
- * Startup warning tests for `config.server.ts` (Requirements 7.7, 8.9, 8.10).
+ * Startup warning tests for `config.server.ts`: the Mock_Mode value warning and
+ * the unauthenticated-startup warning of `shared-coupon-redemption`
+ * (Requirements 7.7, 8.9, 8.10), and the four warnings this feature adds —
+ * absent URI, unparsable URI, missing Clerk keys, empty Admin_Allowlist
+ * (Requirements 1.3, 1.10, 5.2 restated, 6.9).
  *
  * Every case injects its own environment record and its own logger, so no test
  * touches `process.env` and none spies on the global console: the assertions
  * read the captured lines directly.
+ *
+ * The flags, the database-name resolution, and the server-only accessors are
+ * asserted in `mongoConfig.test.ts` against a silent logger, so the two files
+ * do not restate each other. This file asserts only what is logged.
  */
 
 interface CapturingLogger extends ConfigLogger {
   readonly messages: string[]
+  /** Only the lines that name `variable`. */
+  naming: (variable: string) => string[]
   /** Only the lines that name the Mock_Mode variable. */
   mockModeWarnings: () => string[]
 }
 
 function capturingLogger(): CapturingLogger {
   const messages: string[] = []
+  const naming = (variable: string) =>
+    messages.filter((message) => message.includes(variable))
   return {
     messages,
     warn: (message: string) => {
       messages.push(message)
     },
-    mockModeWarnings: () =>
-      messages.filter((message) => message.includes(MOCK_MODE_ENV_VAR)),
+    naming,
+    mockModeWarnings: () => naming(MOCK_MODE_ENV_VAR),
   }
 }
 
-/** An environment whose passphrase is set, so only Mock_Mode warnings appear. */
-function envWithPassphrase(extra: EnvRecord = {}): EnvRecord {
-  return { APP_PASSPHRASE: "correct horse battery staple", ...extra }
+/**
+ * A fully configured environment: passphrase set, a parsable URI, both Clerk
+ * keys, and a non-empty Admin_Allowlist. Startup over this record logs nothing,
+ * so a case that overrides one variable sees exactly the warning that variable
+ * is responsible for.
+ */
+const CONFIGURED_ENV: EnvRecord = {
+  APP_PASSPHRASE: "correct horse battery staple",
+  [MONGODB_URI_ENV_VAR]:
+    "mongodb://zzz-user:zzz-password@zzz-host:27017/zzz-db",
+  [CLERK_PUBLISHABLE_KEY_ENV_VAR]: "pk_test_zzz_publishable",
+  [CLERK_SECRET_KEY_ENV_VAR]: "sk_test_zzz_secret",
+  [ADMIN_EMAILS_ENV_VAR]: "owner@example.com",
+}
+
+/** The configured environment with `extra` applied on top. */
+function configuredEnv(extra: EnvRecord = {}): EnvRecord {
+  return { ...CONFIGURED_ENV, ...extra }
+}
+
+/**
+ * Reads the resolved value the way a later request would — the flags, the
+ * allowlist, the secret accessors, the client projection — and returns the lines
+ * logged during those reads. Every warning belongs to startup, so this is empty
+ * for every case (Requirement 6.9 states it for the allowlist explicitly).
+ */
+function linesLoggedAfterStartup(
+  logger: CapturingLogger,
+  resolved: ResolvedConfig
+): string[] {
+  const alreadyLogged = logger.messages.length
+
+  const { config, secrets } = resolved
+  void config.mongoConfigured
+  void config.mongoUriParsed
+  void config.mongoDatabaseName
+  void config.clerkConfigured
+  void config.adminAllowlist.length
+  void config.passphraseRequired
+  secrets.readMongoUri()
+  secrets.readClerkSecretKey()
+  toClientConfig(config)
+
+  return logger.messages.slice(alreadyLogged)
 }
 
 describe("unrecognized MOCK_MODE value (Requirement 7.7)", () => {
@@ -49,7 +114,7 @@ describe("unrecognized MOCK_MODE value (Requirement 7.7)", () => {
       const logger = capturingLogger()
 
       const { config } = resolveConfig(
-        envWithPassphrase({ [MOCK_MODE_ENV_VAR]: raw }),
+        configuredEnv({ [MOCK_MODE_ENV_VAR]: raw }),
         logger
       )
 
@@ -65,7 +130,7 @@ describe("unrecognized MOCK_MODE value (Requirement 7.7)", () => {
     const logger = capturingLogger()
 
     expect(() =>
-      resolveConfig(envWithPassphrase({ [MOCK_MODE_ENV_VAR]: "yes" }), logger)
+      resolveConfig(configuredEnv({ [MOCK_MODE_ENV_VAR]: "yes" }), logger)
     ).not.toThrow()
   })
 
@@ -73,7 +138,7 @@ describe("unrecognized MOCK_MODE value (Requirement 7.7)", () => {
     const logger = capturingLogger()
 
     const { config } = resolveConfig(
-      envWithPassphrase({
+      configuredEnv({
         [MOCK_MODE_ENV_VAR]: "TRUEISH",
         UPSTREAM_BASE_URL: "http://localhost:9999/evt",
         DATA_FILE: "./tmp/store.json",
@@ -86,11 +151,16 @@ describe("unrecognized MOCK_MODE value (Requirement 7.7)", () => {
       upstreamBaseUrl: "http://localhost:9999/evt",
       dataFile: "./tmp/store.json",
       passphraseRequired: true,
+      mongoConfigured: true,
+      mongoDatabaseName: "zzz-db",
+      mongoUriParsed: true,
+      clerkConfigured: true,
+      adminAllowlist: ["owner@example.com"],
     })
   })
 })
 
-describe("recognized MOCK_MODE values log no warning (Requirement 7.5)", () => {
+describe("a fully configured environment logs nothing (Requirement 7.5)", () => {
   const cases: ReadonlyArray<readonly [string, string | undefined, boolean]> = [
     ["true", "true", true],
     ["TRUE", "TRUE", true],
@@ -102,17 +172,18 @@ describe("recognized MOCK_MODE values log no warning (Requirement 7.5)", () => {
     ["whitespace-only", "   ", false],
   ]
 
-  it.each(cases)("%s", (_label, raw, expected) => {
+  it.each(cases)("%s MOCK_MODE", (_label, raw, expected) => {
     const logger = capturingLogger()
 
-    const { config } = resolveConfig(
-      envWithPassphrase({ [MOCK_MODE_ENV_VAR]: raw }),
+    const resolved = resolveConfig(
+      configuredEnv({ [MOCK_MODE_ENV_VAR]: raw }),
       logger
     )
 
     expect(logger.mockModeWarnings()).toEqual([])
     expect(logger.messages).toEqual([])
-    expect(config.mockMode).toBe(expected)
+    expect(resolved.config.mockMode).toBe(expected)
+    expect(linesLoggedAfterStartup(logger, resolved)).toEqual([])
   })
 })
 
@@ -128,11 +199,15 @@ describe("no Shared_Passphrase configured (Requirement 8.9)", () => {
     (_label, raw) => {
       const logger = capturingLogger()
 
-      const { config, secrets } = resolveConfig({ APP_PASSPHRASE: raw }, logger)
+      const resolved = resolveConfig(
+        configuredEnv({ APP_PASSPHRASE: raw }),
+        logger
+      )
 
-      expect(logger.messages).toContain(NO_PASSPHRASE_WARNING)
-      expect(config.passphraseRequired).toBe(false)
-      expect(secrets.readSharedPassphrase()).toBeNull()
+      expect(logger.messages).toEqual([NO_PASSPHRASE_WARNING])
+      expect(resolved.config.passphraseRequired).toBe(false)
+      expect(resolved.secrets.readSharedPassphrase()).toBeNull()
+      expect(linesLoggedAfterStartup(logger, resolved)).toEqual([])
     }
   )
 
@@ -147,6 +222,11 @@ describe("no Shared_Passphrase configured (Requirement 8.9)", () => {
       upstreamBaseUrl: DEFAULT_UPSTREAM_BASE_URL,
       dataFile: DEFAULT_DATA_FILE,
       passphraseRequired: false,
+      mongoConfigured: false,
+      mongoDatabaseName: null,
+      mongoUriParsed: true,
+      clerkConfigured: false,
+      adminAllowlist: [],
     })
   })
 })
@@ -155,7 +235,10 @@ describe("a configured Shared_Passphrase logs no warning", () => {
   it("sets passphraseRequired and stays silent", () => {
     const logger = capturingLogger()
 
-    const { config } = resolveConfig({ APP_PASSPHRASE: "  s3cret  " }, logger)
+    const { config } = resolveConfig(
+      configuredEnv({ APP_PASSPHRASE: "  s3cret  " }),
+      logger
+    )
 
     expect(logger.messages).toEqual([])
     expect(config.passphraseRequired).toBe(true)
@@ -163,11 +246,246 @@ describe("a configured Shared_Passphrase logs no warning", () => {
 
   it("trims the passphrase before it becomes the Shared_Passphrase", () => {
     const { secrets } = resolveConfig(
-      { APP_PASSPHRASE: "  s3cret  " },
+      configuredEnv({ APP_PASSPHRASE: "  s3cret  " }),
       capturingLogger()
     )
 
     expect(secrets.readSharedPassphrase()).toBe("s3cret")
+  })
+})
+
+describe("no Mongo_Connection_URI configured (Requirement 1.3)", () => {
+  const cases: ReadonlyArray<readonly [string, string | undefined]> = [
+    ["absent", undefined],
+    ["empty", ""],
+    ["whitespace-only", "  \t "],
+  ]
+
+  it.each(cases)("%s MONGODB_URI logs exactly one warning", (_label, raw) => {
+    const logger = capturingLogger()
+
+    const resolved = resolveConfig(
+      configuredEnv({ [MONGODB_URI_ENV_VAR]: raw }),
+      logger
+    )
+
+    expect(logger.messages).toEqual([NO_MONGODB_URI_WARNING])
+    expect(logger.naming(MONGODB_URI_ENV_VAR)).toHaveLength(1)
+    // There is no value to disclose, and the not-parsed warning is not this one.
+    expect(logger.messages[0]).not.toBe(UNPARSABLE_MONGODB_URI_WARNING)
+    expect(linesLoggedAfterStartup(logger, resolved)).toEqual([])
+  })
+
+  it("completes startup rather than throwing", () => {
+    expect(() =>
+      resolveConfig(
+        configuredEnv({ [MONGODB_URI_ENV_VAR]: undefined }),
+        capturingLogger()
+      )
+    ).not.toThrow()
+  })
+})
+
+describe("unparsable Mongo_Connection_URI (Requirement 1.10)", () => {
+  /** Each case pairs a rejected value with the fragments of it that must not be logged. */
+  const cases: ReadonlyArray<readonly [string, string, readonly string[]]> = [
+    [
+      "wrong scheme",
+      "mysql://zzz-user:zzz-password@zzz-host.internal:3306/zzz-db",
+      ["mysql", "zzz-user", "zzz-password", "zzz-host.internal", "3306"],
+    ],
+    [
+      "no scheme",
+      "zzz-host.internal:27017/zzz-db",
+      ["zzz-host.internal", "27017", "zzz-db"],
+    ],
+    [
+      "credentials but no host",
+      "mongodb://zzz-user:zzz-password@/zzz-db",
+      ["zzz-user", "zzz-password", "zzz-db"],
+    ],
+  ]
+
+  it.each(cases)(
+    "%s logs exactly one warning naming MONGODB_URI and no part of the value",
+    (_label, raw, fragments) => {
+      const logger = capturingLogger()
+
+      const resolved = resolveConfig(
+        configuredEnv({ [MONGODB_URI_ENV_VAR]: raw }),
+        logger
+      )
+
+      expect(logger.messages).toEqual([UNPARSABLE_MONGODB_URI_WARNING])
+      const warning = logger.messages[0]
+      expect(warning).toContain(MONGODB_URI_ENV_VAR)
+      expect(warning).not.toContain(raw)
+      for (const fragment of fragments) {
+        expect(warning).not.toContain(fragment)
+      }
+      expect(linesLoggedAfterStartup(logger, resolved)).toEqual([])
+    }
+  )
+
+  it("logs the not-parsed warning rather than the not-set one", () => {
+    const logger = capturingLogger()
+
+    resolveConfig(configuredEnv({ [MONGODB_URI_ENV_VAR]: "not-a-uri" }), logger)
+
+    expect(logger.messages).not.toContain(NO_MONGODB_URI_WARNING)
+  })
+
+  it("completes startup rather than throwing", () => {
+    expect(() =>
+      resolveConfig(
+        configuredEnv({ [MONGODB_URI_ENV_VAR]: "not-a-uri" }),
+        capturingLogger()
+      )
+    ).not.toThrow()
+  })
+})
+
+describe("missing Clerk keys (Requirement 5.2 restated)", () => {
+  const cases: ReadonlyArray<
+    readonly [string, EnvRecord, readonly string[], readonly string[]]
+  > = [
+    [
+      "publishable key absent",
+      { [CLERK_PUBLISHABLE_KEY_ENV_VAR]: undefined },
+      [CLERK_PUBLISHABLE_KEY_ENV_VAR],
+      [CLERK_SECRET_KEY_ENV_VAR],
+    ],
+    [
+      "publishable key blank",
+      { [CLERK_PUBLISHABLE_KEY_ENV_VAR]: "  " },
+      [CLERK_PUBLISHABLE_KEY_ENV_VAR],
+      [CLERK_SECRET_KEY_ENV_VAR],
+    ],
+    [
+      "secret key absent",
+      { [CLERK_SECRET_KEY_ENV_VAR]: undefined },
+      [CLERK_SECRET_KEY_ENV_VAR],
+      [CLERK_PUBLISHABLE_KEY_ENV_VAR],
+    ],
+    [
+      "secret key blank",
+      { [CLERK_SECRET_KEY_ENV_VAR]: "\t" },
+      [CLERK_SECRET_KEY_ENV_VAR],
+      [CLERK_PUBLISHABLE_KEY_ENV_VAR],
+    ],
+    [
+      "both absent",
+      {
+        [CLERK_PUBLISHABLE_KEY_ENV_VAR]: undefined,
+        [CLERK_SECRET_KEY_ENV_VAR]: undefined,
+      },
+      [CLERK_PUBLISHABLE_KEY_ENV_VAR, CLERK_SECRET_KEY_ENV_VAR],
+      [],
+    ],
+  ]
+
+  it.each(cases)(
+    "%s logs exactly one warning naming each missing variable",
+    (_label, override, missing, present) => {
+      const logger = capturingLogger()
+
+      const resolved = resolveConfig(configuredEnv(override), logger)
+
+      expect(logger.messages).toEqual([missingClerkKeysWarning(missing)])
+      const warning = logger.messages[0]
+      for (const variable of missing) {
+        expect(warning).toContain(variable)
+      }
+      /*
+       * A key that is set is not named, and no key *value* is named either —
+       * neither the secret key (Requirement 5.10 restated) nor the publishable
+       * one, which the message has no reason to quote.
+       */
+      for (const variable of present) {
+        expect(logger.naming(variable)).toEqual([])
+      }
+      expect(warning).not.toContain("pk_test_zzz_publishable")
+      expect(warning).not.toContain("sk_test_zzz_secret")
+      expect(linesLoggedAfterStartup(logger, resolved)).toEqual([])
+    }
+  )
+
+  it("completes startup rather than throwing", () => {
+    expect(() =>
+      resolveConfig(
+        configuredEnv({
+          [CLERK_PUBLISHABLE_KEY_ENV_VAR]: undefined,
+          [CLERK_SECRET_KEY_ENV_VAR]: undefined,
+        }),
+        capturingLogger()
+      )
+    ).not.toThrow()
+  })
+})
+
+describe("empty Admin_Allowlist (Requirement 6.9)", () => {
+  const cases: ReadonlyArray<readonly [string, string | undefined]> = [
+    ["absent", undefined],
+    ["empty", ""],
+    ["whitespace-only", "  \t "],
+    ["separators only", " , , "],
+    ["no surviving element", "no-at-sign, also-no-at-sign"],
+  ]
+
+  it.each(cases)(
+    "%s ADMIN_EMAILS logs exactly one startup warning",
+    (_label, raw) => {
+      const logger = capturingLogger()
+
+      const resolved = resolveConfig(
+        configuredEnv({ [ADMIN_EMAILS_ENV_VAR]: raw }),
+        logger
+      )
+
+      expect(logger.messages).toEqual([EMPTY_ADMIN_ALLOWLIST_WARNING])
+      expect(logger.naming(ADMIN_EMAILS_ENV_VAR)).toHaveLength(1)
+      // Logged during startup only: reading the allowlist later logs nothing.
+      expect(linesLoggedAfterStartup(logger, resolved)).toEqual([])
+    }
+  )
+
+  it("logs nothing once the allowlist holds one element", () => {
+    const logger = capturingLogger()
+
+    resolveConfig(
+      configuredEnv({ [ADMIN_EMAILS_ENV_VAR]: " Owner@Example.COM " }),
+      logger
+    )
+
+    expect(logger.messages).toEqual([])
+  })
+
+  it("completes startup rather than throwing", () => {
+    expect(() =>
+      resolveConfig(
+        configuredEnv({ [ADMIN_EMAILS_ENV_VAR]: undefined }),
+        capturingLogger()
+      )
+    ).not.toThrow()
+  })
+})
+
+describe("several unset variables each log their own single warning", () => {
+  it("logs one line per condition and nothing afterwards", () => {
+    const logger = capturingLogger()
+
+    const resolved = resolveConfig({}, logger)
+
+    expect(logger.messages).toEqual([
+      NO_PASSPHRASE_WARNING,
+      NO_MONGODB_URI_WARNING,
+      missingClerkKeysWarning([
+        CLERK_PUBLISHABLE_KEY_ENV_VAR,
+        CLERK_SECRET_KEY_ENV_VAR,
+      ]),
+      EMPTY_ADMIN_ALLOWLIST_WARNING,
+    ])
+    expect(linesLoggedAfterStartup(logger, resolved)).toEqual([])
   })
 })
 
@@ -178,11 +496,11 @@ describe("secrets leak nowhere (Requirement 8.10)", () => {
   function resolveWithSecrets() {
     const logger = capturingLogger()
     const resolved = resolveConfig(
-      {
+      configuredEnv({
         APP_PASSPHRASE: PASSPHRASE,
         SESSION_SECRET,
         [MOCK_MODE_ENV_VAR]: "TRUEISH",
-      },
+      }),
       logger
     )
     return { logger, resolved }

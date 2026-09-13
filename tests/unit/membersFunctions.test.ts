@@ -1,24 +1,32 @@
 /**
  * The Member_Registry envelope mapping (Requirements 1.1, 1.2, 1.3, 1.4, 1.5,
- * 1.8, 1.9, 1.11, 1.12).
+ * 1.9, 1.11, 1.12 of the shared-coupon-redemption spec; Requirements 2.8, 2.14
+ * of the mongodb-google-auth-admin spec).
  *
  * These exercise the four envelope operations of
  * `src/functions/members.functions.ts` and their validators directly, over a
- * store built on an injected flush: no `createServerFn` call site, no HTTP, and
- * no filesystem write. The `DATA_FILE` path handed to every store points into a
- * fresh temporary directory that never exists, so the repository's own
- * `data/store.json` is neither read nor written.
+ * Member_Registry built on the in-memory Mongo_Store of
+ * `tests/support/inMemoryMongoStore.ts`: no `createServerFn` call site, no HTTP,
+ * and no deployment. Every operation is `async` now, reads included, so each
+ * envelope is awaited.
+ *
+ * The persistence warning of the JSON-store era is gone. Requirement 2.8
+ * replaced the applied-but-not-saved success with a rejection, so the two cases
+ * asserted here are a write that landed with zero warnings and a write that did
+ * not land at all — the latter arriving as a `STORE_WRITE_FAILED` envelope
+ * carrying the store's own sentence.
  */
 
-import { mkdtemp, rm } from "node:fs/promises"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
-
-import { afterEach, describe, expect, it } from "vitest"
+import { MongoServerError } from "mongodb"
+import { describe, expect, it } from "vitest"
 
 import { lengthRangeMessage } from "@/domain/schemas"
 import {
-  PERSISTENCE_WARNING,
+  notConfiguredMessage,
+  rosterReadFailedMessage,
+  rosterWriteFailedMessage,
+} from "@/domain/storeMessages"
+import {
   addResultEnvelope,
   addToRoster,
   readRoster,
@@ -28,7 +36,6 @@ import {
   validateRemoveMemberInput,
   validateSetMemberEnabledInput,
 } from "@/functions/members.functions"
-import { createJsonStore } from "@/server/store/jsonStore.server"
 import {
   MEMBER_REGISTRY_MAX_ENTRIES,
   createMemberRegistryStore,
@@ -36,38 +43,40 @@ import {
   memberNotFoundMessage,
   rosterFullMessage,
 } from "@/server/store/memberRegistry.server"
-import type { FlushFn } from "@/server/store/jsonStore.server"
 import type { MemberRegistryStore } from "@/server/store/memberRegistry.server"
 
-const landing: FlushFn = () => Promise.resolve()
-const failing: FlushFn = () => Promise.reject(new Error("disk full"))
+import { createInMemoryMongoStore } from "../support/inMemoryMongoStore"
+import type { InMemoryMongoStoreHandle } from "../support/inMemoryMongoStore"
 
-const tempDirs: Array<string> = []
-
-afterEach(async () => {
-  for (const dir of tempDirs.splice(0)) {
-    await rm(dir, { recursive: true, force: true })
-  }
-})
-
-/** A Member_Registry over a store whose flush behaves as `flush` says. */
-async function registryWith(flush: FlushFn): Promise<MemberRegistryStore> {
-  const dir = await mkdtemp(join(tmpdir(), "scr-members-fn-"))
-  tempDirs.push(dir)
-  return createMemberRegistryStore(
-    createJsonStore({
-      dataFilePath: join(dir, "store.json"),
-      flush,
-      logger: { warn: () => {} },
-    })
-  )
+/**
+ * A deployment that answered, and its answer was no.
+ *
+ * The `reason` on the {@link StoreFailure} decides the code: a refusal is
+ * `rejected`, therefore `STORE_READ_FAILED` or `STORE_WRITE_FAILED`, while a
+ * timeout or a lost connection is `unreachable`, therefore `STORE_UNAVAILABLE`.
+ * Both are covered below.
+ */
+function refused(): MongoServerError {
+  return new MongoServerError({
+    message: "Document failed validation",
+    code: 121,
+  })
 }
 
-describe("a successful write (Requirements 1.1, 1.12)", () => {
-  it("returns the stored entry with zero warnings when the flush lands", async () => {
-    const registry = await registryWith(landing)
+/** A registry over a fresh in-memory store, and the handle behind it. */
+function registry(): {
+  readonly handle: InMemoryMongoStoreHandle
+  readonly store: MemberRegistryStore
+} {
+  const handle = createInMemoryMongoStore()
+  return { handle, store: createMemberRegistryStore(handle.store) }
+}
 
-    const envelope = await addToRoster(registry, {
+describe("a successful write (Requirements 1.1, 1.12, 2.9)", () => {
+  it("returns the stored entry with zero warnings", async () => {
+    const { store } = registry()
+
+    const envelope = await addToRoster(store, {
       memberLabel: "Alice",
       hiveId: "1001",
     })
@@ -80,49 +89,84 @@ describe("a successful write (Requirements 1.1, 1.12)", () => {
     expect(envelope.warnings).toEqual([])
   })
 
-  it("attaches exactly one persistence warning when the flush fails (Requirement 1.8)", async () => {
-    const registry = await registryWith(failing)
+  it("rejects rather than warning when the insert does not land (Requirement 2.8)", async () => {
+    const { handle, store } = registry()
+    handle.setRejection("members", "insertOne", refused())
 
-    const envelope = await addToRoster(registry, {
+    const envelope = await addToRoster(store, {
       memberLabel: "Alice",
       hiveId: "1001",
     })
 
-    expect(envelope.ok).toBe(true)
-    if (!envelope.ok) return
-    expect(envelope.warnings).toEqual([PERSISTENCE_WARNING])
-    expect(PERSISTENCE_WARNING).toContain("not persisted across a restart")
+    /* Requirement 2.8 supersedes the in-memory-with-warning behaviour of
+     * shared-coupon-redemption Requirement 1.8: there is no applied-but-unsaved
+     * state left, so a write that failed is a rejection rather than a success
+     * carrying a warning. */
+    expect(envelope.ok).toBe(false)
+    if (envelope.ok) return
+    expect(envelope.error.code).toBe("STORE_WRITE_FAILED")
+    expect(envelope.error.message).toBe(
+      rosterWriteFailedMessage({ operation: "add", memberLabel: "Alice" })
+    )
 
-    // The change is still served from memory.
-    const roster = readRoster(registry)
-    expect(roster.ok).toBe(true)
-    if (!roster.ok) return
-    expect(roster.data.map((entry) => entry.hiveId)).toEqual(["1001"])
+    // And nothing is served from memory either: the collection is unchanged.
+    const roster = await readRoster(store)
+    expect(roster.ok && roster.data).toEqual([])
   })
 })
 
-describe("the roster read (Requirement 1.4)", () => {
-  it("returns every entry in insertion order with no warning", async () => {
-    const registry = await registryWith(landing)
+describe("the roster read (Requirements 1.4, 2.2, 2.14)", () => {
+  it("returns every entry in position order with no warning", async () => {
+    const { store } = registry()
     for (const hiveId of ["c", "a", "b"]) {
-      await addToRoster(registry, { memberLabel: `Member ${hiveId}`, hiveId })
+      await addToRoster(store, { memberLabel: `Member ${hiveId}`, hiveId })
     }
 
-    const envelope = readRoster(registry)
+    const envelope = await readRoster(store)
 
     expect(envelope.ok).toBe(true)
     if (!envelope.ok) return
     expect(envelope.data.map((entry) => entry.hiveId)).toEqual(["c", "a", "b"])
     expect(envelope.warnings).toEqual([])
   })
+
+  it("rejects with zero entries when the read does not complete", async () => {
+    const { handle, store } = registry()
+    await addToRoster(store, { memberLabel: "Alice", hiveId: "1001" })
+    handle.setRejection("members", "find", refused())
+
+    const envelope = await readRoster(store)
+
+    /* Requirement 2.14: a database that could not be read does not render as an
+     * empty roster. */
+    expect(envelope.ok).toBe(false)
+    if (envelope.ok) return
+    expect(envelope.error.code).toBe("STORE_READ_FAILED")
+    expect(envelope.error.message).toBe(rosterReadFailedMessage())
+  })
+
+  it("reports STORE_UNAVAILABLE when nothing was attempted at all", async () => {
+    const { handle, store } = registry()
+    handle.setCollectionFailure("members", {
+      reason: "not-configured",
+      message: notConfiguredMessage(),
+    })
+
+    const envelope = await readRoster(store)
+
+    expect(envelope.ok).toBe(false)
+    if (envelope.ok) return
+    expect(envelope.error.code).toBe("STORE_UNAVAILABLE")
+    expect(envelope.error.message).toBe(notConfiguredMessage())
+  })
 })
 
 describe("rejections carry the store's own message", () => {
   it("names the conflicting Member_Label on a duplicate Hive_ID (Requirement 1.2)", async () => {
-    const registry = await registryWith(landing)
-    await addToRoster(registry, { memberLabel: "Alice", hiveId: "1001" })
+    const { store } = registry()
+    await addToRoster(store, { memberLabel: "Alice", hiveId: "1001" })
 
-    const envelope = await addToRoster(registry, {
+    const envelope = await addToRoster(store, {
       memberLabel: "Bob",
       hiveId: " 1001 ",
     })
@@ -148,9 +192,9 @@ describe("rejections carry the store's own message", () => {
   })
 
   it("names the field and its range on an invalid value (Requirement 1.3)", async () => {
-    const registry = await registryWith(landing)
+    const { store } = registry()
 
-    const envelope = await addToRoster(registry, {
+    const envelope = await addToRoster(store, {
       memberLabel: "   ",
       hiveId: "1001",
     })
@@ -163,18 +207,18 @@ describe("rejections carry the store's own message", () => {
     )
 
     // Nothing was stored.
-    const roster = readRoster(registry)
+    const roster = await readRoster(store)
     expect(roster.ok && roster.data).toEqual([])
   })
 
   it("reports MEMBER_NOT_FOUND for an unknown id (Requirements 1.5, 1.9)", async () => {
-    const registry = await registryWith(landing)
+    const { store } = registry()
 
-    const toggled = await setRosterEntryEnabled(registry, {
+    const toggled = await setRosterEntryEnabled(store, {
       id: "no-such-id",
       enabled: false,
     })
-    const removed = await removeFromRoster(registry, { id: "no-such-id" })
+    const removed = await removeFromRoster(store, { id: "no-such-id" })
 
     for (const envelope of [toggled, removed]) {
       expect(envelope.ok).toBe(false)
@@ -187,15 +231,15 @@ describe("rejections carry the store's own message", () => {
 
 describe("the enabled state and removal (Requirements 1.5, 1.9)", () => {
   it("returns the updated entry, then removes it by id", async () => {
-    const registry = await registryWith(landing)
-    const added = await addToRoster(registry, {
+    const { store } = registry()
+    const added = await addToRoster(store, {
       memberLabel: "Alice",
       hiveId: "1001",
     })
     expect(added.ok).toBe(true)
     if (!added.ok) return
 
-    const toggled = await setRosterEntryEnabled(registry, {
+    const toggled = await setRosterEntryEnabled(store, {
       id: added.data.id,
       enabled: false,
     })
@@ -204,11 +248,40 @@ describe("the enabled state and removal (Requirements 1.5, 1.9)", () => {
     expect(toggled.data).toEqual({ ...added.data, enabled: false })
     expect(toggled.warnings).toEqual([])
 
-    const removed = await removeFromRoster(registry, { id: added.data.id })
+    const removed = await removeFromRoster(store, { id: added.data.id })
     expect(removed.ok).toBe(true)
     if (!removed.ok) return
     expect(removed.data).toEqual({ id: added.data.id })
-    expect(readRoster(registry).ok && registry.list()).toEqual([])
+
+    const roster = await readRoster(store)
+    expect(roster.ok && roster.data).toEqual([])
+  })
+
+  it("reports a failed change with the operation it attempted (Requirement 2.8)", async () => {
+    const { handle, store } = registry()
+    const added = await addToRoster(store, {
+      memberLabel: "Alice",
+      hiveId: "1001",
+    })
+    expect(added.ok).toBe(true)
+    if (!added.ok) return
+
+    handle.setRejection("members", "deleteOne", refused())
+    const removed = await removeFromRoster(store, { id: added.data.id })
+
+    expect(removed.ok).toBe(false)
+    if (removed.ok) return
+    expect(removed.error.code).toBe("STORE_WRITE_FAILED")
+    expect(removed.error.message).toBe(
+      rosterWriteFailedMessage({ operation: "remove", memberLabel: "Alice" })
+    )
+
+    // The entry is still there: nothing was deleted.
+    handle.clearRejection("members", "deleteOne")
+    const roster = await readRoster(store)
+    expect(roster.ok && roster.data.map((entry) => entry.hiveId)).toEqual([
+      "1001",
+    ])
   })
 })
 

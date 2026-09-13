@@ -96,7 +96,11 @@ import {
   runFailureMessage,
   runStateReducer,
 } from "@/components/runState"
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
+import {
+  ROSTER_UNAVAILABLE_TITLE,
+  StoreFailureNotice,
+} from "@/components/StoreFailureNotice"
+import { Alert, AlertDescription } from "@/components/ui/alert"
 import {
   Card,
   CardContent,
@@ -140,6 +144,20 @@ export const MOCK_MODE_RESULT_MESSAGE =
  */
 export const STREAM_INTERRUPTED_MESSAGE =
   "The redemption run stopped reporting before it finished. Open the history page to check whether it completed."
+
+/**
+ * What the form's description says while the roster read is the thing that
+ * failed (Requirement 2.14).
+ *
+ * A failed read hands this page zero entries, and the description that goes with
+ * zero entries states that no Group_Member is enabled yet — which would be a claim
+ * about the roster that the read never learned. So the two are told apart here for
+ * the same reason the roster page tells them apart: an unreachable database must
+ * not read as an empty roster. The store's own sentence is above, in
+ * {@link StoreFailureNotice}; this is the line that would otherwise contradict it.
+ */
+export const ROSTER_UNREAD_DESCRIPTION =
+  "The roster could not be read, so no redemption run can start."
 
 /** Everything the document reads before any submission. */
 interface RedemptionView {
@@ -384,22 +402,26 @@ export function RedemptionPage({
         ) : null}
       </div>
 
-      {/* The server's own sentence, as a JSX child so every character of it
-       * renders as a character. */}
+      {/* Requirement 2.14. The store's own sentence, as a JSX child so every
+       * character of it renders as a character. */}
       {loadError === null ? null : (
-        <Alert variant="destructive">
-          <AlertTitle>Roster unavailable</AlertTitle>
-          <AlertDescription>{loadError}</AlertDescription>
-        </Alert>
+        <StoreFailureNotice
+          title={ROSTER_UNAVAILABLE_TITLE}
+          message={loadError}
+        />
       )}
 
       <Card>
         <CardHeader>
           <CardTitle>Coupon code</CardTitle>
           <CardDescription>
-            {hasEnabledMember
-              ? "A confirmation lists every enabled group member before anything is sent."
-              : "No group member is enabled yet, so no redemption run can start."}
+            {/* Three states, not two: a roster with an enabled member, a roster
+             * without one, and a roster this page never got to see. */}
+            {loadError !== null
+              ? ROSTER_UNREAD_DESCRIPTION
+              : hasEnabledMember
+                ? "A confirmation lists every enabled group member before anything is sent."
+                : "No group member is enabled yet, so no redemption run can start."}
           </CardDescription>
         </CardHeader>
         <CardContent className="flex flex-col gap-4">

@@ -21,7 +21,9 @@
  * 1. Reject when a Redemption_Run is already active, leaving that run untouched
  *    (Requirement 3.9).
  * 2. Acquire the lock.
- * 3. Snapshot `listEnabled()` as the fixed list (Requirement 5.5).
+ * 3. Snapshot `listEnabled()` as the fixed list (Requirement 5.5), rejecting when
+ *    the roster read did not complete: there is no fixed list, so there is no run
+ *    (Requirement 2.14).
  * 4. Reject when that list is empty (Requirement 3.8).
  *
  * The lock is acquired **before** the snapshot and released in a `finally` that
@@ -103,6 +105,8 @@ import type {
   RunEvent,
   UpstreamResult,
 } from "@/domain/types"
+import { storeReadFailureCode } from "@/domain/storeFailures"
+import { historyAppendFailedMessage } from "@/domain/storeMessages"
 import { toHistoryOutcomeRows } from "@/server/store/history.server"
 import type {
   AppendHistoryInput,
@@ -111,10 +115,20 @@ import type {
 import type { MemberRegistryStore } from "@/server/store/memberRegistry.server"
 import type { UpstreamClient } from "@/server/upstream/client"
 
-/** The two rejection codes {@link RunCoordinator.start} can produce. */
+/**
+ * The rejection codes {@link RunCoordinator.start} can produce.
+ *
+ * The first two are the roster conditions the requirements name: a
+ * Redemption_Run already in progress (Requirement 3.9) and an empty fixed list
+ * (Requirement 3.8). The last two are the roster read that did not complete
+ * (Requirement 2.14) — a run has no fixed list to iterate, so it cannot start.
+ */
 export type RunStartErrorCode = Extract<
   AppErrorCode,
-  "NO_ENABLED_MEMBERS" | "RUN_IN_PROGRESS"
+  | "NO_ENABLED_MEMBERS"
+  | "RUN_IN_PROGRESS"
+  | "STORE_UNAVAILABLE"
+  | "STORE_READ_FAILED"
 >
 
 /**
@@ -152,14 +166,17 @@ export function runInProgressMessage(): string {
 
 /**
  * The single warning a failed Redemption_History append adds to
- * {@link RedemptionRunResult.warnings} (Requirement 6.8). The Member_Outcomes
- * are still returned; only their durability is lost.
+ * {@link RedemptionRunResult.warnings} (Requirement 3.7, which supersedes the
+ * wording of the shared-coupon-redemption spec's Requirement 6.8). The
+ * Member_Outcomes are still returned; only their durability is lost.
  *
- * A constant rather than a function, so the unit test of the failure path and
- * the run loop cannot drift apart on wording.
+ * The wording is now the store's own Requirement 3.7 sentence,
+ * {@link historyAppendFailedMessage}, so the append-failure warning the store
+ * describes and the one the run loop attaches are the same text by construction.
+ * A constant rather than an inline call, so the unit test of the failure path
+ * and the run loop cannot drift apart on which warning is meant.
  */
-export const HISTORY_NOT_PERSISTED_WARNING =
-  "The Redemption_History record is not persisted. The Member_Outcomes of this Redemption_Run are complete, but they will be missing from the history view after a restart."
+export const HISTORY_NOT_PERSISTED_WARNING = historyAppendFailedMessage()
 
 /** How much of a failure message the `run-failed` event repeats. */
 const MAX_FAILURE_DETAIL_LENGTH = 300
@@ -211,22 +228,22 @@ export function runFailedMessage(failure: unknown): string {
 
 /**
  * Appends the one Redemption_History record of a Redemption_Run and reports
- * whether it was persisted (Requirements 6.5, 6.8).
+ * whether the record is in the database (Requirements 6.5, 6.8, 3.7).
  *
- * `JsonStore.mutate` already turns a failed flush into `persisted: false`, so a
- * rejection here means the store itself misbehaved. It is caught rather than
- * propagated because the Member_Outcomes must survive a broken history: losing
- * a complete result set over a bookkeeping write would break the count
- * invariant of Requirement 5.6 for the client. Either way the caller sees the
- * same not-persisted warning.
+ * The store reports a failed append as `failed`, carrying its own fixed
+ * sentence, so a *rejection* here means the store itself misbehaved. It is caught
+ * rather than propagated because the Member_Outcomes must survive a broken
+ * history: losing a complete result set over a bookkeeping write would break the
+ * count invariant of Requirement 5.6 for the client. Either way the caller adds
+ * the same single warning.
  */
 async function appendHistoryRecord(
   history: HistoryStore,
   input: AppendHistoryInput
 ): Promise<boolean> {
   try {
-    const { persisted } = await history.append(input)
-    return persisted
+    const result = await history.append(input)
+    return result.kind === "appended"
   } catch {
     return false
   }
@@ -365,7 +382,27 @@ export function createRunCoordinator(
       // Snapshotted once. A Member_Registry mutation during the run cannot
       // change this array, so the Group_Members reported as SKIPPED are exactly
       // the ones positioned after the early stop (Requirement 5.5).
-      fixedList = registry.listEnabled()
+      const roster = await registry.listEnabled()
+      if (roster.kind === "failed") {
+        /*
+         * There is no fixed list, so there is no run: the loop has nothing to
+         * iterate, no Group_Member can be reported, and Requirement 5.5's
+         * "snapshotted once" has nothing to snapshot. That makes it a pre-flight
+         * rejection like the two above — the same shape the redemption pipeline
+         * turns into a terminal `run-failed` event with an empty outcome list —
+         * rather than a run that started and failed. Nothing was sent upstream
+         * and no Redemption_History record is appended.
+         *
+         * The sentence is the store's own (Requirement 2.14); the code is
+         * `STORE_UNAVAILABLE` when nothing was served at all and
+         * `STORE_READ_FAILED` when the deployment refused the read.
+         */
+        throw new RunStartError(
+          storeReadFailureCode(roster.failure),
+          roster.failure.message
+        )
+      }
+      fixedList = roster.entries
       run.total = fixedList.length
 
       if (fixedList.length === 0) {
@@ -467,7 +504,7 @@ export function createRunCoordinator(
      * below (Requirement 5.8).
      */
     if (serverFailure === null) {
-      const persisted = await appendHistoryRecord(dependencies.history, {
+      const appended = await appendHistoryRecord(dependencies.history, {
         runId,
         couponCode: coupon,
         completedAt,
@@ -475,8 +512,8 @@ export function createRunCoordinator(
         stoppedEarly: stopped,
         outcomes: toHistoryOutcomeRows(outcomes),
       })
-      if (!persisted) {
-        // One warning, no matter how the append failed (Requirement 6.8).
+      if (!appended) {
+        // One warning, no matter how the append failed (Requirements 6.8, 3.7).
         warnings.push(HISTORY_NOT_PERSISTED_WARNING)
       }
     }
