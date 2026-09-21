@@ -29,8 +29,8 @@ import { describe, expect, it } from "vitest"
 
 import type { Collection, Document } from "mongodb"
 
-import { buildAdminOverview } from "@/functions/admin.functions"
-import type { AdminOverviewDeps } from "@/functions/admin.functions"
+import { buildAdminOverview } from "@/server/adminOverview.server"
+import type { AdminOverviewDeps } from "@/server/adminOverview.server"
 import { mongoUnavailableCountMessage } from "@/domain/storeMessages"
 import type { Authorization } from "@/server/authorization.server"
 import type {

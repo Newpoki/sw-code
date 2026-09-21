@@ -34,7 +34,7 @@ import fc from "fast-check"
 import { describe, expect, it } from "vitest"
 
 import type { AccountRole, AdminOverview } from "@/domain/accounts"
-import { buildAdminOverview } from "@/functions/admin.functions"
+import { buildAdminOverview } from "@/server/adminOverview.server"
 import type { Authorization } from "@/server/authorization.server"
 import type { Identity } from "@/server/identity.server"
 import type {

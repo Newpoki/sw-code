@@ -159,23 +159,35 @@ export function ShellNav({ isAdmin }: { readonly isAdmin: boolean }) {
  *
  * Exported and prop-driven so the chrome rule is renderable without a
  * `ClerkProvider`: `hasClerkSession` stands for "the request carries a valid
- * Clerk session" and `email` for the bound User_Account's email. When
- * `hasClerkSession` is false neither the email nor the sign-out control renders;
- * when it is true both do. `RootLayout` supplies these from Clerk's own client
- * session — `<Show when="signed-in">` gates on the live session and
- * `useUser()` reads the email — so the live app's `hasClerkSession` is exactly
- * Clerk's client-session state.
+ * Clerk session", `email` for the bound User_Account's email, and `imageUrl`
+ * for the account's avatar image. When `hasClerkSession` is false none of the
+ * avatar, the email, or the sign-out control renders; when it is true the
+ * sign-out control always renders, the email renders when present, and the
+ * avatar renders when an image URL is present. `RootLayout` supplies these from
+ * Clerk's own client session — `<Show when="signed-in">` gates on the live
+ * session and `useUser()` reads the email and the avatar URL — so the live
+ * app's `hasClerkSession` is exactly Clerk's client-session state.
  */
 export function ShellSessionControls({
   hasClerkSession,
   email,
+  imageUrl = null,
 }: {
   readonly hasClerkSession: boolean
   readonly email: string | null
+  readonly imageUrl?: string | null
 }) {
   if (!hasClerkSession) return null
   return (
     <>
+      {imageUrl ? (
+        <img
+          src={imageUrl}
+          alt={email ?? "Signed-in user"}
+          className="size-7 rounded-full object-cover"
+          data-slot="session-avatar"
+        />
+      ) : null}
       {email ? (
         <span
           className="text-sm text-muted-foreground"
@@ -311,17 +323,21 @@ function RootLayout() {
  *
  * Rendered only inside `<Show when="signed-in">`, so the request carries a valid
  * Clerk session whenever this mounts — hence `hasClerkSession` is fixed `true`
- * here, and the presentational {@link ShellSessionControls} draws both the email
- * and the sign-out control. `useUser()` supplies the email; the optional chain
- * is defensive against the brief window before the user object hydrates and
- * against an Identity_Provider that asserted no primary email, and
- * `ShellSessionControls` withholds only the email span in that case, never the
- * sign-out control.
+ * here, and the presentational {@link ShellSessionControls} draws the avatar,
+ * the email, and the sign-out control. `useUser()` supplies the email and the
+ * avatar URL; the optional chains are defensive against the brief window before
+ * the user object hydrates, against an Identity_Provider that asserted no
+ * primary email, and against an account with no avatar image, and
+ * `ShellSessionControls` withholds only the affected element in each case, never
+ * the sign-out control.
  */
 function ClerkSessionEmail() {
   const { user } = useUser()
   const email = user?.primaryEmailAddress?.emailAddress ?? null
-  return <ShellSessionControls hasClerkSession email={email} />
+  const imageUrl = user?.hasImage ? user.imageUrl : null
+  return (
+    <ShellSessionControls hasClerkSession email={email} imageUrl={imageUrl} />
+  )
 }
 
 function RootDocument({ children }: { children: React.ReactNode }) {

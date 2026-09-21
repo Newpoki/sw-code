@@ -57,9 +57,27 @@ import {
   THROTTLED_MESSAGE,
   getAuth,
 } from "@/server/auth.server"
-import { SIGN_IN_PATH } from "@/server/gate.server"
 
-import type { GateRejectionNeeds } from "@/server/gate.server"
+/**
+ * What a gate rejection says the sender must do, mirrored from
+ * `gate.server.ts`'s `GateRejectionNeeds`. Declared locally rather than
+ * imported — even as a type — so this client route reaches nothing in a
+ * `.server` module: the build's import-protection denies a `.server` import
+ * from a route, and keeping the union here (it is two fixed strings) keeps
+ * `login.tsx` free of `gate.server` entirely. `src/server/gate.server.ts`
+ * remains the source of truth for the values the server emits; a drift between
+ * the two would surface as a type error where the gate builds its rejection.
+ */
+type GateRejectionNeeds = "passphrase" | "passphrase-and-sign-in"
+
+/**
+ * Path of the sign-in document a Requirement 7.8 rejection points an
+ * unauthenticated sender to. A literal rather than an import of `SIGN_IN_PATH`,
+ * because that constant lives in `gate.server.ts`, a `.server` module the
+ * browser bundle must not load; `src/routes/sign-in.tsx` declares the same path.
+ * This mirrors the local `LOGIN_PATH` literal above, kept for the same reason.
+ */
+const SIGN_IN_PATH = "/sign-in"
 
 /** Name of the form field holding the submitted value. */
 const PASSPHRASE_FIELD = "passphrase"
